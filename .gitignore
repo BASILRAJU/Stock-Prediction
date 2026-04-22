@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+
+# Environment variables and secrets - NEVER commit this
+.env
+
+# Data files - too large for GitHub
+data/
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Parquet files
+*.parquet
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
