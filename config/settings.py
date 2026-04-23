@@ -57,7 +57,7 @@ class Settings(BaseSettings):
         return self.us_tickers + self.ca_tickers
 
     # ── yfinance Settings ─────────────────────────────────────
-    yf_daily_period: str = "2y"
+    yf_daily_period: str = "5y"
     yf_intraday_interval: str = "1h"
     yf_intraday_period: str = "60d"
 

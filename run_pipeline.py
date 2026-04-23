@@ -9,7 +9,6 @@ score sentiment, and save enriched feature files.
 Usage:
     python run_pipeline.py                    # full pipeline
     python run_pipeline.py --skip-sentiment   # Phase 1 only
-    python run_pipeline.py --skip-macro       # skip Alpha Vantage
 """
 
 import sys
@@ -32,12 +31,15 @@ console = Console()
 
 def run_pipeline(
     tickers: list[str] = None,
-    period: str = "2y",
+    period: str = None,
     include_sentiment: bool = True,
     use_cache: bool = True,
 ):
     start_time = time.time()
+
+    # Use settings as defaults
     tickers = tickers or settings.all_tickers
+    period  = period  or settings.yf_daily_period
 
     # Parse command line args
     if "--skip-sentiment" in sys.argv:

@@ -4,13 +4,14 @@ src/ingestion/yfinance_fetcher.py
 Downloads OHLCV price data from Yahoo Finance.
 Compatible with yfinance 1.3.0 and pandas 3.0.
 Handles US stocks, Canadian stocks (.TO), ETFs, and crypto (BTC-USD).
+Uses explicit date ranges for reliable 5-year data fetching.
 """
 
 from __future__ import annotations
 
 import hashlib
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +19,21 @@ import yfinance as yf
 
 from config.settings import settings
 from src.utils.logger import log
+
+
+# ─── Period to days mapping ───────────────────────────────────
+
+PERIOD_TO_DAYS = {
+    "1d":  1,
+    "5d":  5,
+    "1mo": 30,
+    "3mo": 90,
+    "6mo": 180,
+    "1y":  365,
+    "2y":  730,
+    "5y":  1825,
+    "10y": 3650,
+}
 
 
 # ─── Cache Helpers ────────────────────────────────────────────
@@ -74,11 +90,16 @@ def _clean_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df = _flatten_columns(df)
 
     # Remove rows where all price columns are zero
-    price_cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
+    price_cols = [
+        c for c in ["open", "high", "low", "close"]
+        if c in df.columns
+    ]
     if price_cols:
         zero_mask = (df[price_cols] == 0).all(axis=1)
         if zero_mask.any():
-            log.warning(f"[{ticker}] Removing {zero_mask.sum()} zero-price rows")
+            log.warning(
+                f"[{ticker}] Removing {zero_mask.sum()} zero-price rows"
+            )
             df = df[~zero_mask]
 
     # Remove duplicate timestamps
@@ -122,6 +143,7 @@ class YFinanceFetcher:
     Downloads stock price data from Yahoo Finance.
 
     Features:
+      - Explicit date ranges for reliable multi-year data
       - Disk cache to avoid re-downloading same data
       - Automatic retry if download fails
       - Handles US, Canadian (.TO), ETF, and crypto tickers
@@ -146,13 +168,16 @@ class YFinanceFetcher:
     ) -> pd.DataFrame:
         """
         Download daily OHLCV data for one ticker.
-        Returns DataFrame with columns: open, high, low, close, volume, ticker
+        Returns DataFrame with columns:
+        open, high, low, close, volume, ticker
         Index: DatetimeIndex (UTC)
         """
         period = period or settings.yf_daily_period
         cache_file = _cache_path(_cache_key(ticker, "1d", period))
 
-        if use_cache and _is_cache_fresh(cache_file, self.cache_max_age_hours):
+        if use_cache and _is_cache_fresh(
+            cache_file, self.cache_max_age_hours
+        ):
             log.debug(f"[{ticker}] Loading daily from cache")
             return pd.read_parquet(cache_file)
 
@@ -171,10 +196,10 @@ class YFinanceFetcher:
     ) -> pd.DataFrame:
         """
         Download 1-hour intraday data for one ticker.
-        Yahoo Finance allows max 60 days for hourly data.
+        Yahoo Finance allows max 730 days for hourly data.
         """
-        interval  = settings.yf_intraday_interval
-        period    = settings.yf_intraday_period
+        interval   = settings.yf_intraday_interval
+        period     = settings.yf_intraday_period
         cache_file = _cache_path(_cache_key(ticker, interval, period))
 
         if use_cache and _is_cache_fresh(cache_file, max_age_hours=0.5):
@@ -198,9 +223,8 @@ class YFinanceFetcher:
         """
         Download daily data for multiple tickers.
         Returns dict of {ticker: DataFrame}.
-        Fetches each ticker individually to avoid MultiIndex complexity.
         """
-        period = period or settings.yf_daily_period
+        period  = period or settings.yf_daily_period
         results: dict[str, pd.DataFrame] = {}
 
         for ticker in tickers:
@@ -228,23 +252,35 @@ class YFinanceFetcher:
         interval: str,
         period: str,
     ) -> pd.DataFrame:
-        """Download from Yahoo Finance with automatic retry."""
+        """
+        Download from Yahoo Finance using explicit date ranges.
+        More reliable than period strings for multi-year data.
+        """
+        # Convert period string to explicit start/end dates
+        days = PERIOD_TO_DAYS.get(period, 730)
+        end_date   = date.today()
+        start_date = end_date - timedelta(days=days)
+
         for attempt in range(1, self.max_retries + 1):
             try:
                 log.info(
-                    f"[{ticker}] Downloading {interval} data "
+                    f"[{ticker}] Downloading {interval} "
+                    f"from {start_date} to {end_date} "
                     f"(attempt {attempt}/{self.max_retries})"
                 )
                 df = yf.download(
                     tickers=ticker,
+                    start=start_date.isoformat(),
+                    end=end_date.isoformat(),
                     interval=interval,
-                    period=period,
                     auto_adjust=True,
                     progress=False,
                     multi_level_index=False,
                 )
                 if df.empty:
-                    raise ValueError("Empty response from Yahoo Finance")
+                    raise ValueError(
+                        "Empty response from Yahoo Finance"
+                    )
                 return df
 
             except Exception as e:
@@ -257,5 +293,5 @@ class YFinanceFetcher:
                     time.sleep(wait)
 
         raise RuntimeError(
-            f"[{ticker}] All {self.max_retries} download attempts failed"
+            f"[{ticker}] All {self.max_retries} attempts failed"
         )
