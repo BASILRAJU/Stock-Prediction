@@ -1,16 +1,19 @@
 """
 run_pipeline.py
 ────────────────
-Phase 1 main runner.
+Phase 1 + Phase 2 combined pipeline runner.
 
-Run this every day to fetch fresh data and rebuild features.
+Runs every day to fetch fresh data, build features,
+score sentiment, and save enriched feature files.
 
 Usage:
-    python run_pipeline.py
+    python run_pipeline.py                    # full pipeline
+    python run_pipeline.py --skip-sentiment   # Phase 1 only
+    python run_pipeline.py --skip-macro       # skip Alpha Vantage
 """
 
+import sys
 import time
-from datetime import datetime
 
 from rich.console import Console
 from rich.table import Table
@@ -18,8 +21,10 @@ from rich.panel import Panel
 
 from config.settings import settings
 from src.ingestion.yfinance_fetcher import YFinanceFetcher
-from src.ingestion.alpha_vantage_fetcher import AlphaVantageFetcher
 from src.features.technical_indicators import build_features
+from src.sentiment.news_fetcher import NewsFetcher
+from src.sentiment.finbert_scorer import FinBERTScorer
+from src.sentiment.sentiment_merger import SentimentMerger
 from src.utils.logger import log
 
 console = Console()
@@ -28,170 +33,236 @@ console = Console()
 def run_pipeline(
     tickers: list[str] = None,
     period: str = "2y",
-    fetch_macro: bool = True,
-    fetch_fundamentals: bool = True,
+    include_sentiment: bool = True,
     use_cache: bool = True,
 ):
-    """
-    Full Phase 1 pipeline:
-    1. Download OHLCV for all tickers
-    2. Build 98 technical features per ticker
-    3. Fetch macro indicators from Alpha Vantage
-    4. Fetch company fundamentals from Alpha Vantage
-    5. Save everything to data/processed/
-    6. Print summary report
-    """
     start_time = time.time()
     tickers = tickers or settings.all_tickers
 
+    # Parse command line args
+    if "--skip-sentiment" in sys.argv:
+        include_sentiment = False
+
     console.print(Panel(
-        f"[bold]Phase 1 Pipeline — AI Stock Prediction System[/bold]\n"
-        f"Tickers: {', '.join(tickers)}\n"
-        f"Period:  {period} | "
-        f"Macro: {fetch_macro} | "
-        f"Fundamentals: {fetch_fundamentals}",
+        f"[bold]AI Stock Prediction — Phase 1 + 2 Pipeline[/bold]\n"
+        f"Tickers:   {', '.join(tickers)}\n"
+        f"Period:    {period} | "
+        f"Sentiment: {include_sentiment} | "
+        f"Cache:     {use_cache}",
         style="blue"
     ))
 
     # ── Results tracking ──────────────────────────────────────
-    success = []
-    failed  = []
-    feature_data = {}
+    success  = []
+    failed   = []
+    features = {}
+    enriched = {}
 
     # ─────────────────────────────────────────────────────────
     # STEP 1: Download price data
     # ─────────────────────────────────────────────────────────
-    console.print("\n[bold cyan]Step 1/4: Downloading price data...[/bold cyan]")
+    console.print(
+        "\n[bold cyan]Step 1/5: Downloading price data...[/bold cyan]"
+    )
     yf = YFinanceFetcher()
 
     for ticker in tickers:
         try:
-            df = yf.fetch_daily(ticker, period=period, use_cache=use_cache)
-            feature_data[ticker] = df
-            console.print(f"  [green]✓[/green] {ticker}: {len(df)} daily bars")
+            df = yf.fetch_daily(
+                ticker, period=period, use_cache=use_cache
+            )
+            features[ticker] = df
+            console.print(
+                f"  [green]✓[/green] {ticker}: {len(df)} bars"
+            )
         except Exception as e:
             console.print(f"  [red]✗[/red] {ticker}: {e}")
             failed.append(ticker)
-            log.error(f"[{ticker}] Price download failed: {e}")
 
     # ─────────────────────────────────────────────────────────
     # STEP 2: Build technical features
     # ─────────────────────────────────────────────────────────
     console.print(
-        "\n[bold cyan]Step 2/4: Building technical features...[/bold cyan]"
+        "\n[bold cyan]Step 2/5: Building technical features...[/bold cyan]"
     )
     processed = {}
 
-    for ticker, df in feature_data.items():
+    for ticker, df in features.items():
         try:
             feat_df = build_features(df, ticker=ticker, drop_nulls=True)
-
-            # Save to disk as Parquet
-            out_path = settings.data_processed_path / f"{ticker}_features.parquet"
+            out_path = (
+                settings.data_processed_path /
+                f"{ticker}_features.parquet"
+            )
             feat_df.to_parquet(out_path)
-
             processed[ticker] = feat_df
             success.append(ticker)
             console.print(
                 f"  [green]✓[/green] {ticker}: "
-                f"{feat_df.shape[0]} rows × {feat_df.shape[1]} features "
-                f"→ saved"
+                f"{feat_df.shape[0]} rows × {feat_df.shape[1]} features"
             )
         except Exception as e:
             console.print(f"  [red]✗[/red] {ticker}: {e}")
             failed.append(ticker)
-            log.error(f"[{ticker}] Feature build failed: {e}")
 
     # ─────────────────────────────────────────────────────────
-    # STEP 3: Fetch macro indicators
+    # STEP 3: Fetch news headlines
     # ─────────────────────────────────────────────────────────
-    macro_wide = None
-    if fetch_macro:
+    all_articles: dict = {}
+
+    if include_sentiment:
         console.print(
-            "\n[bold cyan]Step 3/4: Fetching macro indicators "
-            "(Alpha Vantage — this takes ~60s on free tier)...[/bold cyan]"
+            "\n[bold cyan]Step 3/5: Fetching news headlines...[/bold cyan]"
         )
-        av = AlphaVantageFetcher()
         try:
-            macro_dict = av.fetch_all_macro(use_cache=use_cache)
-            macro_wide = av.get_macro_wide(macro_dict)
-
-            # Save macro data
-            if not macro_wide.empty:
-                macro_path = settings.data_processed_path / "macro_wide.parquet"
-                macro_wide.to_parquet(macro_path)
-                console.print(
-                    f"  [green]✓[/green] Macro data: "
-                    f"{macro_wide.shape[0]} periods × "
-                    f"{macro_wide.shape[1]} indicators → saved"
-                )
+            news = NewsFetcher()
+            for ticker in success:
+                try:
+                    articles = news.fetch_ticker(
+                        ticker, days=7, use_cache=use_cache
+                    )
+                    all_articles[ticker] = articles
+                    console.print(
+                        f"  [green]✓[/green] {ticker}: "
+                        f"{len(articles)} headlines"
+                    )
+                except Exception as e:
+                    console.print(
+                        f"  [yellow]![/yellow] {ticker}: {e}"
+                    )
+                    all_articles[ticker] = []
         except Exception as e:
-            console.print(f"  [red]✗[/red] Macro fetch failed: {e}")
-            log.error(f"Macro fetch failed: {e}")
+            console.print(f"  [red]✗[/red] News fetcher error: {e}")
+            include_sentiment = False
     else:
-        console.print("\n[dim]Step 3/4: Macro skipped[/dim]")
+        console.print("\n[dim]Step 3/5: Sentiment skipped[/dim]")
 
     # ─────────────────────────────────────────────────────────
-    # STEP 4: Fetch fundamentals (US tickers only)
+    # STEP 4: Score sentiment with FinBERT
     # ─────────────────────────────────────────────────────────
-    if fetch_fundamentals:
+    all_scores: dict = {}
+
+    if include_sentiment and all_articles:
         console.print(
-            "\n[bold cyan]Step 4/4: Fetching fundamentals "
-            "(US tickers only)...[/bold cyan]"
+            "\n[bold cyan]Step 4/5: Scoring sentiment with FinBERT...[/bold cyan]"
         )
-        av = AlphaVantageFetcher()
-        us_tickers = [t for t in success if not t.endswith(".TO")]
+        try:
+            scorer = FinBERTScorer()
+            for ticker in success:
+                articles = all_articles.get(ticker, [])
+                if not articles:
+                    all_scores[ticker] = []
+                    continue
+                try:
+                    scored = scorer.score_ticker(
+                        ticker,
+                        articles,
+                        use_cache=use_cache,
+                        filter_neutral=True,
+                    )
+                    all_scores[ticker] = scored
+                    bullish = sum(
+                        1 for s in scored if s["signal"] == 1
+                    )
+                    bearish = sum(
+                        1 for s in scored if s["signal"] == -1
+                    )
+                    console.print(
+                        f"  [green]✓[/green] {ticker}: "
+                        f"{bullish} bullish, {bearish} bearish signals"
+                    )
+                except Exception as e:
+                    console.print(
+                        f"  [yellow]![/yellow] {ticker}: {e}"
+                    )
+                    all_scores[ticker] = []
+        except Exception as e:
+            console.print(f"  [red]✗[/red] FinBERT error: {e}")
+    else:
+        console.print("\n[dim]Step 4/5: Scoring skipped[/dim]")
 
-        for ticker in us_tickers:
+    # ─────────────────────────────────────────────────────────
+    # STEP 5: Merge sentiment onto features
+    # ─────────────────────────────────────────────────────────
+    if include_sentiment and all_scores:
+        console.print(
+            "\n[bold cyan]"
+            "Step 5/5: Merging sentiment onto features..."
+            "[/bold cyan]"
+        )
+        merger = SentimentMerger()
+        for ticker in success:
             try:
-                snap = av.fetch_fundamentals(
-                    ticker, use_cache=use_cache
+                feat_df  = processed[ticker]
+                scored   = all_scores.get(ticker, [])
+                enriched_df = merger.merge(feat_df, scored, ticker)
+                enriched[ticker] = enriched_df
+
+                out_path = (
+                    settings.data_processed_path /
+                    f"{ticker}_features_with_sentiment.parquet"
                 )
+                enriched_df.to_parquet(out_path)
                 console.print(
                     f"  [green]✓[/green] {ticker}: "
-                    f"P/E={snap.pe_ratio}, "
-                    f"Beta={snap.beta}, "
-                    f"Sector={snap.sector}"
+                    f"{enriched_df.shape[0]} rows × "
+                    f"{enriched_df.shape[1]} columns → saved"
                 )
             except Exception as e:
                 console.print(
-                    f"  [yellow]![/yellow] {ticker} fundamentals: {e}"
+                    f"  [red]✗[/red] {ticker} merge failed: {e}"
                 )
     else:
-        console.print("\n[dim]Step 4/4: Fundamentals skipped[/dim]")
+        console.print("\n[dim]Step 5/5: Merge skipped[/dim]")
 
     # ─────────────────────────────────────────────────────────
-    # SUMMARY REPORT
+    # SUMMARY TABLE
     # ─────────────────────────────────────────────────────────
     duration = round(time.time() - start_time, 1)
 
     table = Table(
-        title="Phase 1 Results",
+        title="Pipeline Results",
         show_header=True,
-        header_style="bold"
+        header_style="bold",
     )
-    table.add_column("Ticker",   style="cyan", width=10)
-    table.add_column("Status",   width=12)
-    table.add_column("Rows",     width=8)
-    table.add_column("Features", width=10)
+    table.add_column("Ticker",       style="cyan", width=10)
+    table.add_column("Status",       width=12)
+    table.add_column("Features",     width=10)
+    table.add_column("Sentiment",    width=12)
     table.add_column("Latest Close", width=14)
 
     for ticker in success:
-        feat_df = processed.get(ticker)
-        if feat_df is not None:
-            latest_close = (
-                f"${feat_df['close'].iloc[-1]:.2f}"
-                if "close" in feat_df.columns else "—"
-            )
-            table.add_row(
-                ticker,
-                "[green]✓ Success[/green]",
-                str(feat_df.shape[0]),
-                str(feat_df.shape[1]),
-                latest_close,
-            )
+        feat_df  = processed.get(ticker)
+        enr_df   = enriched.get(ticker, feat_df)
+        scored   = all_scores.get(ticker, [])
 
-    for ticker in failed:
+        if feat_df is None:
+            continue
+
+        latest = (
+            f"${feat_df['close'].iloc[-1]:.2f}"
+            if "close" in feat_df.columns else "—"
+        )
+        bullish = sum(1 for s in scored if s.get("signal") == 1)
+        bearish = sum(1 for s in scored if s.get("signal") == -1)
+        sent_str = (
+            f"[green]+{bullish}[/green]/[red]-{bearish}[/red]"
+            if scored else "[dim]n/a[/dim]"
+        )
+        feat_count = (
+            str(enr_df.shape[1]) if enr_df is not None
+            else str(feat_df.shape[1])
+        )
+
+        table.add_row(
+            ticker,
+            "[green]✓ Success[/green]",
+            feat_count,
+            sent_str,
+            latest,
+        )
+
+    for ticker in set(failed):
         table.add_row(
             ticker,
             "[red]✗ Failed[/red]",
@@ -200,29 +271,21 @@ def run_pipeline(
 
     console.print(f"\n")
     console.print(table)
-
-    success_rate = (
-        len(success) / len(tickers) * 100
-        if tickers else 0
-    )
     console.print(
         f"\n[bold]Done in {duration}s[/bold] | "
         f"Success: {len(success)}/{len(tickers)} "
-        f"({success_rate:.0f}%)"
+        f"({len(success)/len(tickers)*100:.0f}%)"
     )
     console.print(
-        f"[dim]Features saved to: "
+        f"[dim]Enriched features saved to: "
         f"{settings.data_processed_path}[/dim]"
     )
 
-    return processed
+    return enriched if enriched else processed
 
 
 if __name__ == "__main__":
-    # Run with all your tickers
-    # Set fetch_macro=False to skip Alpha Vantage for a quick test
     run_pipeline(
-        fetch_macro=False,
-        fetch_fundamentals=False,
         use_cache=True,
+        include_sentiment=True,
     )
