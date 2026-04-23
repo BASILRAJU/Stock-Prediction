@@ -11,28 +11,21 @@ Defines the shared interface:
   - save() / load()  persists model to disk
 
 Target variable:
-  We predict whether the stock will be UP or DOWN
-  5 trading days from now.
-  Binary classification: 1 = up, 0 = down
+  Binary: will close be higher in target_days? (1=up, 0=down)
 
-Train/Test split strategy:
-  We use TIME-BASED splitting — never random.
-  Random splits cause look-ahead bias in time series.
+Train/Test split:
+  TIME-BASED — never random (prevents look-ahead bias)
   Train: first 80% of dates
-  Test:  last 20% of dates (most recent data)
+  Test:  last 20% (most recent data)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    roc_auc_score,
-)
+from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 from config.settings import settings
@@ -58,14 +51,14 @@ class BaseStockModel:
         target_days: int = 5,
         test_size: float = 0.2,
     ):
-        self.model_name  = model_name
-        self.ticker      = ticker
-        self.target_days = target_days
-        self.test_size   = test_size
-        self.model       = None
-        self.scaler      = StandardScaler()
+        self.model_name   = model_name
+        self.ticker       = ticker
+        self.target_days  = target_days
+        self.test_size    = test_size
+        self.model        = None
+        self.scaler       = StandardScaler()
         self.feature_cols: list[str] = []
-        self.is_trained  = False
+        self.is_trained   = False
 
     # ── Data Preparation ──────────────────────────────────────
 
@@ -78,24 +71,15 @@ class BaseStockModel:
 
         Target: 1 if close price is higher in target_days, else 0
         Split:  Time-based (no random shuffling)
-
-        Returns: X_train, X_test, y_train, y_test
         """
         df = df.copy()
 
-        # ── Build target variable ─────────────────────────────
-        # Future return: is price higher in target_days?
         future_return = (
             df["close"].shift(-self.target_days) / df["close"] - 1
         )
         df["target"] = (future_return > 0).astype(int)
-
-        # Drop last target_days rows (no future data yet)
         df = df.dropna(subset=["target"])
 
-        # ── Select feature columns ────────────────────────────
-        # Exclude: price columns, ticker, target
-        # Include: all indicator and sentiment columns
         exclude = {
             "open", "high", "low", "close", "volume",
             "ticker", "target",
@@ -103,24 +87,20 @@ class BaseStockModel:
         self.feature_cols = [
             c for c in df.columns
             if c not in exclude
-            and df[c].dtype in [np.float64, np.float32,
-                                  np.int64, np.int32]
+            and df[c].dtype in [
+                np.float64, np.float32, np.int64, np.int32
+            ]
         ]
 
-        # Drop any remaining nulls
         df = df.dropna(subset=self.feature_cols)
 
         X = df[self.feature_cols].values
         y = df["target"].values
 
-        # ── Time-based train/test split ───────────────────────
         split_idx = int(len(X) * (1 - self.test_size))
         X_train, X_test = X[:split_idx], X[split_idx:]
         y_train, y_test = y[:split_idx], y[split_idx:]
 
-        # ── Scale features ────────────────────────────────────
-        # Fit scaler on training data ONLY
-        # Never fit on test data — that would be data leakage
         X_train = self.scaler.fit_transform(X_train)
         X_test  = self.scaler.transform(X_test)
 
@@ -129,12 +109,6 @@ class BaseStockModel:
             f"train={len(X_train)}, test={len(X_test)}, "
             f"features={len(self.feature_cols)}, "
             f"target_days={self.target_days}"
-        )
-
-        class_balance = y_train.mean()
-        log.debug(
-            f"[{self.ticker}] Class balance (train): "
-            f"{class_balance:.1%} bullish"
         )
 
         return X_train, X_test, y_train, y_test
@@ -150,7 +124,11 @@ class BaseStockModel:
         Evaluate model on test set.
         Returns dict of performance metrics.
         """
-        if self.model is None:
+        model_ready = (
+            self.model is not None
+            or getattr(self, "network", None) is not None
+        )
+        if not model_ready:
             raise RuntimeError("Model not trained yet")
 
         y_pred  = self.predict_classes(X_test)
@@ -214,10 +192,6 @@ class BaseStockModel:
         2. Train model
         3. Evaluate on test set
         4. Return metrics
-
-        Usage:
-            model = XGBoostModel("AAPL")
-            metrics = model.fit_and_evaluate(features_df)
         """
         X_train, X_test, y_train, y_test = self.prepare_data(df)
         self.train(X_train, y_train)
