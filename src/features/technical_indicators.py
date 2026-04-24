@@ -389,20 +389,150 @@ class TechnicalFeatureEngine:
         f     = pd.DataFrame(index=df.index)
 
         try:
-            f["cdl_doji"]          = ta.cdl_doji(open_, high, low, close)
-            f["cdl_hammer"]        = ta.cdl_hammer(open_, high, low, close)
-            f["cdl_engulfing"]     = ta.cdl_engulfing(open_, high, low, close)
-            f["cdl_morning_star"]  = ta.cdl_morning_star(open_, high, low, close)
-            f["cdl_evening_star"]  = ta.cdl_evening_star(open_, high, low, close)
+            # Core candle geometry
+            body       = (close - open_).abs()
+            candle     = (high - low).replace(0, np.nan)
+            upper_wick = high - pd.concat([open_, close], axis=1).max(axis=1)
+            lower_wick = pd.concat([open_, close], axis=1).min(axis=1) - low
+            body_pct   = body / candle
+
+            # ── Single-candle patterns ────────────────────────
+            # Doji — tiny body, indecision
+            f["cdl_doji"] = (body_pct < 0.1).astype(int)
+
+            # Hammer — long lower wick, small body at top (bullish reversal)
+            f["cdl_hammer"] = (
+                (lower_wick > 2 * body) &
+                (upper_wick < body) &
+                (body_pct < 0.4)
+            ).astype(int)
+
+            # Inverted hammer — long upper wick, small body at bottom
+            f["cdl_inv_hammer"] = (
+                (upper_wick > 2 * body) &
+                (lower_wick < body) &
+                (body_pct < 0.4) &
+                (close > open_)
+            ).astype(int)
+
+            # Shooting star — long upper wick at top of uptrend (bearish)
+            f["cdl_shooting_star"] = (
+                (upper_wick > 2 * body) &
+                (lower_wick < body) &
+                (body_pct < 0.4) &
+                (open_ > close)
+            ).astype(int)
+
+            # Spinning top — small body, wicks on both sides
+            f["cdl_spinning_top"] = (
+                (body_pct < 0.3) &
+                (upper_wick > body) &
+                (lower_wick > body)
+            ).astype(int)
+
+            # Marubozu bullish — full green body, almost no wicks
+            f["cdl_marubozu_bull"] = (
+                (close > open_) &
+                (body_pct > 0.9)
+            ).astype(int)
+
+            # Marubozu bearish — full red body, almost no wicks
+            f["cdl_marubozu_bear"] = (
+                (open_ > close) &
+                (body_pct > 0.9)
+            ).astype(int)
+
+            # ── Two-candle patterns ───────────────────────────
+            # Bullish engulfing — green candle engulfs prior red
+            f["cdl_engulfing_bull"] = (
+                (open_.shift(1) > close.shift(1)) &   # prior red
+                (close > open_) &                      # current green
+                (close > open_.shift(1)) &             # engulfs top
+                (open_ < close.shift(1))               # engulfs bottom
+            ).astype(int)
+
+            # Bearish engulfing — red candle engulfs prior green
+            f["cdl_engulfing_bear"] = (
+                (close.shift(1) > open_.shift(1)) &   # prior green
+                (open_ > close) &                      # current red
+                (open_ > close.shift(1)) &             # engulfs top
+                (close < open_.shift(1))               # engulfs bottom
+            ).astype(int)
+
+            # Bullish harami — small green inside prior red
+            f["cdl_harami_bull"] = (
+                (open_.shift(1) > close.shift(1)) &   # prior red
+                (close > open_) &                      # current green
+                (open_ > close.shift(1)) &             # inside prior
+                (close < open_.shift(1))
+            ).astype(int)
+
+            # Bearish harami — small red inside prior green
+            f["cdl_harami_bear"] = (
+                (close.shift(1) > open_.shift(1)) &   # prior green
+                (open_ > close) &                      # current red
+                (close > open_.shift(1)) &             # inside prior
+                (open_ < close.shift(1))
+            ).astype(int)
+
+            # ── Three-candle patterns ─────────────────────────
+            # Morning star — bullish reversal (red, small, green)
+            f["cdl_morning_star"] = (
+                (open_.shift(2) > close.shift(2)) &           # day1 red
+                (body.shift(1) < body.shift(2) * 0.3) &       # day2 small
+                (close > open_) &                              # day3 green
+                (close > (open_.shift(2) + close.shift(2)) / 2)  # above midpoint
+            ).astype(int)
+
+            # Evening star — bearish reversal (green, small, red)
+            f["cdl_evening_star"] = (
+                (close.shift(2) > open_.shift(2)) &           # day1 green
+                (body.shift(1) < body.shift(2) * 0.3) &       # day2 small
+                (open_ > close) &                              # day3 red
+                (close < (open_.shift(2) + close.shift(2)) / 2)  # below midpoint
+            ).astype(int)
+
+            # Three white soldiers — 3 consecutive strong green candles
+            f["cdl_three_soldiers"] = (
+                (close > open_) &
+                (close.shift(1) > open_.shift(1)) &
+                (close.shift(2) > open_.shift(2)) &
+                (close > close.shift(1)) &
+                (close.shift(1) > close.shift(2)) &
+                (body_pct > 0.5) &
+                (body_pct.shift(1) > 0.5) &
+                (body_pct.shift(2) > 0.5)
+            ).astype(int)
+
+            # Three black crows — 3 consecutive strong red candles
+            f["cdl_three_crows"] = (
+                (open_ > close) &
+                (open_.shift(1) > close.shift(1)) &
+                (open_.shift(2) > close.shift(2)) &
+                (close < close.shift(1)) &
+                (close.shift(1) < close.shift(2)) &
+                (body_pct > 0.5) &
+                (body_pct.shift(1) > 0.5) &
+                (body_pct.shift(2) > 0.5)
+            ).astype(int)
+
+            # Fill NaN from shift operations
+            cdl_cols = [c for c in f.columns if c.startswith("cdl_")]
+            f[cdl_cols] = f[cdl_cols].fillna(0).astype(int)
+
+            log.info(
+                f"Candlestick patterns: {len(cdl_cols)} patterns added"
+            )
+
         except Exception as e:
             log.warning(f"Candlestick patterns failed: {e}")
 
-        # Body and wick sizes
-        f["body_size"]   = abs(close - open_) / open_
-        f["upper_wick"]  = (
+        # Body and wick size ratios (always calculated)
+        f["body_size"]  = (close - open_).abs() / open_
+        f["upper_wick"] = (
             high - pd.concat([open_, close], axis=1).max(axis=1)
         ) / open_
-        f["lower_wick"]  = (
+        f["lower_wick"] = (
             pd.concat([open_, close], axis=1).min(axis=1) - low
         ) / open_
 

@@ -1,31 +1,26 @@
 """
 src/ensemble/signal_engine.py
 ───────────────────────────────
-Combines XGBoost + LSTM predictions into a single
+Combines XGBoost + LSTM + CNN predictions into a single
 Bullish / Neutral / Bearish trading signal with confidence.
 
+Three specialist models:
+  XGBoost — reads 117 numeric features (tabular patterns)
+  LSTM    — reads 60-day sequences (temporal patterns)
+  CNN     — reads 30-day chart images (visual patterns)
+
 Dynamic weighting:
-  Models are weighted by their AUC score from training.
-  Better-performing model gets more influence.
-  This is Sharpe-ratio-inspired dynamic weighting
-  from TradingAgents research (arXiv:2412.20138).
+  Models weighted by AUC score from training.
+  Better model gets more influence on final signal.
 
 Signal thresholds:
   probability > 0.55  → BULLISH
   probability < 0.45  → BEARISH
-  otherwise           → NEUTRAL (no trade)
+  otherwise           → NEUTRAL
 
-Confidence filtering (research-backed):
-  Only act on signals where models AGREE.
-  Disagreement between models → NEUTRAL.
-  This reduces false signals significantly.
-
-Output per ticker:
-  signal:      BULLISH / NEUTRAL / BEARISH
-  confidence:  0.0 to 1.0
-  xgb_prob:    XGBoost bullish probability
-  lstm_prob:   LSTM bullish probability
-  agreement:   True if both models agree on direction
+Confidence filtering:
+  Only act when models AGREE on direction.
+  Disagreement → NEUTRAL (no trade).
 """
 
 from __future__ import annotations
@@ -33,6 +28,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -40,29 +36,30 @@ import pandas as pd
 from config.settings import settings
 from src.models.xgboost_model import XGBoostModel
 from src.models.lstm_model import LSTMModel
+from src.models.cnn_model import CNNModel
+from src.models.chart_generator import ChartGenerator
 from src.models.base_model import MODELS_DIR
 from src.utils.logger import log
 
 RESULTS_FILE = MODELS_DIR / "ensemble_results.json"
 
-# ─── Signal thresholds ────────────────────────────────────────
-BULLISH_THRESHOLD = 0.55   # above this → bullish
-BEARISH_THRESHOLD = 0.45   # below this → bearish
-AGREEMENT_MARGIN  = 0.05   # models must agree within this margin
+BULLISH_THRESHOLD = 0.55
+BEARISH_THRESHOLD = 0.45
 
 
 @dataclass
 class TradingSignal:
-    """Output signal for one ticker."""
-    ticker:      str
-    signal:      str        # BULLISH / NEUTRAL / BEARISH
-    confidence:  float      # 0.0 to 1.0
-    xgb_prob:    float      # XGBoost bullish probability
-    lstm_prob:   float      # LSTM bullish probability
-    ensemble_prob: float    # weighted combination
-    agreement:   bool       # do models agree?
-    xgb_weight:  float      # dynamic weight given to XGBoost
-    lstm_weight: float      # dynamic weight given to LSTM
+    ticker:        str
+    signal:        str
+    confidence:    float
+    xgb_prob:      float
+    lstm_prob:     float
+    cnn_prob:      float
+    ensemble_prob: float
+    agreement:     bool
+    xgb_weight:    float
+    lstm_weight:   float
+    cnn_weight:    float
 
     def __str__(self) -> str:
         emoji = (
@@ -74,39 +71,31 @@ class TradingSignal:
         return (
             f"{emoji} {self.ticker:8s} {self.signal:8s} "
             f"confidence={self.confidence:.1%} | "
-            f"xgb={self.xgb_prob:.3f} lstm={self.lstm_prob:.3f} "
+            f"xgb={self.xgb_prob:.3f} "
+            f"lstm={self.lstm_prob:.3f} "
+            f"cnn={self.cnn_prob:.3f} "
             f"ensemble={self.ensemble_prob:.3f} | {agree}"
         )
 
 
 class SignalEngine:
     """
-    Loads trained models and generates trading signals.
-
-    Usage:
-        engine = SignalEngine()
-        engine.load_models(['AAPL', 'MSFT'])
-        signals = engine.generate_signals(['AAPL', 'MSFT'])
-        for sig in signals.values():
-            print(sig)
+    Loads XGBoost + LSTM + CNN models and generates
+    ensemble trading signals.
     """
 
     def __init__(self):
         self.xgb_models:  dict[str, XGBoostModel] = {}
         self.lstm_models: dict[str, LSTMModel]    = {}
+        self.cnn_models:  dict[str, CNNModel]      = {}
         self.weights:     dict[str, dict]          = {}
+        self.chart_gen    = None
         self._load_weights()
 
     def _load_weights(self) -> None:
-        """
-        Load model accuracy scores to compute dynamic weights.
-        Weight = AUC score (higher AUC → more weight).
-        """
+        """Load AUC-based dynamic weights for all models."""
         if not RESULTS_FILE.exists():
-            log.warning(
-                "No ensemble_results.json found. "
-                "Run ensemble_trainer.py first."
-            )
+            log.warning("No ensemble_results.json found.")
             return
 
         with open(RESULTS_FILE) as f:
@@ -119,18 +108,22 @@ class SignalEngine:
             lstm_auc = model_results.get(
                 "lstm", {}
             ).get("auc_roc", 0.5)
+            cnn_auc  = model_results.get(
+                "cnn", {}
+            ).get("auc_roc", 0.5)
 
-            # Normalise weights to sum to 1.0
-            total = xgb_auc + lstm_auc
+            total = xgb_auc + lstm_auc + cnn_auc
             if total > 0:
                 xgb_w  = xgb_auc  / total
                 lstm_w = lstm_auc / total
+                cnn_w  = cnn_auc  / total
             else:
-                xgb_w = lstm_w = 0.5
+                xgb_w = lstm_w = cnn_w = 1/3
 
             self.weights[ticker] = {
-                "xgboost": round(xgb_w, 4),
+                "xgboost": round(xgb_w,  4),
                 "lstm":    round(lstm_w, 4),
+                "cnn":     round(cnn_w,  4),
             }
 
         log.info(
@@ -139,63 +132,70 @@ class SignalEngine:
         )
 
     def load_models(self, tickers: list[str] = None) -> None:
-        """Load trained XGBoost + LSTM models from disk."""
+        """Load XGBoost + LSTM + CNN models from disk."""
         tickers = tickers or settings.all_tickers
 
         for ticker in tickers:
             xgb_path  = MODELS_DIR / f"xgboost_{ticker}.joblib"
             lstm_path = MODELS_DIR / f"lstm_{ticker}.pt"
-
-            loaded_any = False
+            cnn_path  = MODELS_DIR / f"cnn_{ticker}.pt"
 
             if xgb_path.exists():
                 try:
                     xgb = XGBoostModel(ticker)
                     xgb.load(xgb_path)
                     self.xgb_models[ticker] = xgb
-                    loaded_any = True
                 except Exception as e:
-                    log.error(
-                        f"[{ticker}] XGBoost load failed: {e}"
-                    )
+                    log.error(f"[{ticker}] XGBoost load: {e}")
 
             if lstm_path.exists():
                 try:
                     lstm = LSTMModel(ticker)
                     lstm.load(lstm_path)
                     self.lstm_models[ticker] = lstm
-                    loaded_any = True
                 except Exception as e:
-                    log.error(
-                        f"[{ticker}] LSTM load failed: {e}"
-                    )
+                    log.error(f"[{ticker}] LSTM load: {e}")
 
-            if loaded_any:
-                w = self.weights.get(
-                    ticker, {"xgboost": 0.5, "lstm": 0.5}
-                )
+            if cnn_path.exists():
+                try:
+                    cnn = CNNModel(ticker)
+                    cnn.load(cnn_path)
+                    self.cnn_models[ticker] = cnn
+                except Exception as e:
+                    log.error(f"[{ticker}] CNN load: {e}")
+
+            w = self.weights.get(
+                ticker,
+                {"xgboost": 0.34, "lstm": 0.33, "cnn": 0.33}
+            )
+            models_loaded = []
+            if ticker in self.xgb_models:
+                models_loaded.append("XGBoost")
+            if ticker in self.lstm_models:
+                models_loaded.append("LSTM")
+            if ticker in self.cnn_models:
+                models_loaded.append("CNN")
+
+            if models_loaded:
                 log.info(
-                    f"[{ticker}] Models loaded | "
-                    f"weights: xgb={w['xgboost']:.2f}, "
-                    f"lstm={w['lstm']:.2f}"
-                )
-            else:
-                log.warning(
-                    f"[{ticker}] No models found — "
-                    f"run ensemble_trainer first"
+                    f"[{ticker}] Loaded: {', '.join(models_loaded)} | "
+                    f"weights xgb={w['xgboost']:.2f} "
+                    f"lstm={w['lstm']:.2f} "
+                    f"cnn={w['cnn']:.2f}"
                 )
 
     def _get_latest_features(
         self,
         ticker: str,
         sequence_len: int = 60,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """
-        Load the latest features for one ticker.
+        Load latest features for XGBoost, LSTM, and CNN.
 
         Returns:
-            xgb_X:  (1, n_features) for XGBoost
-            lstm_X: (1, sequence_len, n_features) for LSTM
+            xgb_X:   (1, n_features)
+            lstm_X:  (1, 60, n_features)
+            cnn_X:   (3, 224, 224) or None
         """
         data_path = (
             settings.data_processed_path /
@@ -203,23 +203,22 @@ class SignalEngine:
         )
         if not data_path.exists():
             raise FileNotFoundError(
-                f"No feature file found for {ticker}. "
-                f"Run run_pipeline.py first."
+                f"No feature file for {ticker}"
             )
 
         df = pd.read_parquet(data_path)
 
+        exclude = {
+            "open", "high", "low", "close",
+            "volume", "ticker",
+        }
+
         # ── XGBoost features ──────────────────────────────────
         xgb_model = self.xgb_models.get(ticker)
-        if xgb_model and xgb_model.feature_cols:
-            feat_cols = xgb_model.feature_cols
-        else:
-            # Fall back to all numeric non-price columns
-            exclude = {
-                "open", "high", "low", "close",
-                "volume", "ticker",
-            }
-            feat_cols = [
+        feat_cols  = (
+            xgb_model.feature_cols
+            if xgb_model and xgb_model.feature_cols
+            else [
                 c for c in df.columns
                 if c not in exclude
                 and df[c].dtype in [
@@ -227,88 +226,88 @@ class SignalEngine:
                     np.int64, np.int32
                 ]
             ]
+        )
 
-        df_clean = df.dropna(subset=feat_cols)
+        df_clean   = df.dropna(subset=feat_cols)
         latest_row = df_clean[feat_cols].iloc[-1:].values
-
-        # Scale using XGBoost's fitted scaler
-        if xgb_model and xgb_model.scaler:
-            latest_scaled = xgb_model.scaler.transform(latest_row)
-        else:
-            latest_scaled = latest_row
-
-        xgb_X = latest_scaled
+        xgb_X      = (
+            xgb_model.scaler.transform(latest_row)
+            if xgb_model and xgb_model.scaler
+            else latest_row
+        )
 
         # ── LSTM sequence ─────────────────────────────────────
         lstm_model = self.lstm_models.get(ticker)
-        if lstm_model and lstm_model.feature_cols:
-            lstm_cols = lstm_model.feature_cols
-        else:
-            lstm_cols = feat_cols
+        lstm_cols  = (
+            lstm_model.feature_cols
+            if lstm_model and lstm_model.feature_cols
+            else feat_cols
+        )
+        df_lstm    = df.dropna(subset=lstm_cols)
+        seq_data   = df_lstm[lstm_cols].iloc[-sequence_len:].values
+        seq_scaled = (
+            lstm_model.scaler.transform(seq_data)
+            if lstm_model and lstm_model.scaler
+            else seq_data
+        )
+        lstm_X = seq_scaled[np.newaxis, :, :].astype(np.float32)
 
-        df_lstm = df.dropna(subset=lstm_cols)
-        if len(df_lstm) < sequence_len:
-            raise ValueError(
-                f"[{ticker}] Not enough data for LSTM sequence: "
-                f"need {sequence_len}, have {len(df_lstm)}"
-            )
+        # ── CNN chart image ───────────────────────────────────
+        cnn_X = None
+        cnn_model = self.cnn_models.get(ticker)
+        if cnn_model:
+            try:
+                if self.chart_gen is None:
+                    self.chart_gen = ChartGenerator(window_days=30)
+                window_df = df[
+                    ["open", "high", "low", "close", "volume"]
+                ].dropna().iloc[-30:]
+                img = self.chart_gen.ohlcv_to_image(window_df)
+                cnn_X = img.transpose(2, 0, 1)  # (3, 224, 224)
+            except Exception as e:
+                log.warning(f"[{ticker}] CNN image failed: {e}")
 
-        seq_data = df_lstm[lstm_cols].iloc[-sequence_len:].values
-
-        # Scale using LSTM's fitted scaler
-        if lstm_model and lstm_model.scaler:
-            seq_scaled = lstm_model.scaler.transform(seq_data)
-        else:
-            seq_scaled = seq_data
-
-        lstm_X = seq_scaled[np.newaxis, :, :]  # (1, seq_len, features)
-
-        return xgb_X.astype(np.float32), lstm_X.astype(np.float32)
+        return xgb_X.astype(np.float32), lstm_X, cnn_X
 
     def generate_signal(self, ticker: str) -> TradingSignal:
-        """
-        Generate a trading signal for one ticker.
-
-        Combines XGBoost + LSTM probabilities using
-        AUC-based dynamic weights.
-        """
+        """Generate ensemble signal for one ticker."""
         xgb_prob  = 0.5
         lstm_prob = 0.5
+        cnn_prob  = 0.5
         has_xgb   = ticker in self.xgb_models
         has_lstm  = ticker in self.lstm_models
+        has_cnn   = ticker in self.cnn_models
 
-        if not has_xgb and not has_lstm:
-            log.warning(f"[{ticker}] No models loaded")
+        if not has_xgb and not has_lstm and not has_cnn:
             return TradingSignal(
                 ticker=ticker, signal="NEUTRAL",
                 confidence=0.0, xgb_prob=0.5,
-                lstm_prob=0.5, ensemble_prob=0.5,
-                agreement=False, xgb_weight=0.5,
-                lstm_weight=0.5,
+                lstm_prob=0.5, cnn_prob=0.5,
+                ensemble_prob=0.5, agreement=False,
+                xgb_weight=0.34, lstm_weight=0.33,
+                cnn_weight=0.33,
             )
 
         try:
-            xgb_X, lstm_X = self._get_latest_features(ticker)
+            xgb_X, lstm_X, cnn_X = self._get_latest_features(ticker)
         except Exception as e:
             log.error(f"[{ticker}] Feature load failed: {e}")
             return TradingSignal(
                 ticker=ticker, signal="NEUTRAL",
                 confidence=0.0, xgb_prob=0.5,
-                lstm_prob=0.5, ensemble_prob=0.5,
-                agreement=False, xgb_weight=0.5,
-                lstm_weight=0.5,
+                lstm_prob=0.5, cnn_prob=0.5,
+                ensemble_prob=0.5, agreement=False,
+                xgb_weight=0.34, lstm_weight=0.33,
+                cnn_weight=0.33,
             )
 
-        # Get probabilities from each model
         if has_xgb:
             try:
                 xgb_prob = float(
                     self.xgb_models[ticker].predict_proba(xgb_X)[0]
                 )
             except Exception as e:
-                log.warning(
-                    f"[{ticker}] XGBoost predict failed: {e}"
-                )
+                log.warning(f"[{ticker}] XGBoost predict: {e}")
                 has_xgb = False
 
         if has_lstm:
@@ -317,33 +316,50 @@ class SignalEngine:
                     self.lstm_models[ticker].predict_proba(lstm_X)[0]
                 )
             except Exception as e:
-                log.warning(
-                    f"[{ticker}] LSTM predict failed: {e}"
-                )
+                log.warning(f"[{ticker}] LSTM predict: {e}")
                 has_lstm = False
 
-        # Dynamic weights from AUC scores
-        w = self.weights.get(
-            ticker, {"xgboost": 0.5, "lstm": 0.5}
-        )
-        xgb_w  = w["xgboost"] if has_xgb else 0.0
-        lstm_w = w["lstm"]    if has_lstm else 0.0
+        if has_cnn and cnn_X is not None:
+            try:
+                cnn_prob = self.cnn_models[ticker].predict_proba_image(
+                    cnn_X
+                )
+            except Exception as e:
+                log.warning(f"[{ticker}] CNN predict: {e}")
+                has_cnn = False
 
-        # Renormalise if one model missing
-        total_w = xgb_w + lstm_w
+        # Dynamic weights
+        w = self.weights.get(
+            ticker,
+            {"xgboost": 0.34, "lstm": 0.33, "cnn": 0.33}
+        )
+        xgb_w  = w["xgboost"] if has_xgb  else 0.0
+        lstm_w = w["lstm"]    if has_lstm else 0.0
+        cnn_w  = w["cnn"]     if has_cnn  else 0.0
+
+        total_w = xgb_w + lstm_w + cnn_w
         if total_w > 0:
             xgb_w  /= total_w
             lstm_w /= total_w
+            cnn_w  /= total_w
 
-        # Weighted ensemble probability
-        ensemble_prob = xgb_w * xgb_prob + lstm_w * lstm_prob
+        ensemble_prob = (
+            xgb_w  * xgb_prob  +
+            lstm_w * lstm_prob +
+            cnn_w  * cnn_prob
+        )
 
-        # Check model agreement
-        xgb_direction  = "up" if xgb_prob  > 0.5 else "down"
-        lstm_direction = "up" if lstm_prob > 0.5 else "down"
-        agreement = (xgb_direction == lstm_direction)
+        # Agreement — all available models point same direction
+        directions = []
+        if has_xgb:
+            directions.append("up" if xgb_prob  > 0.5 else "down")
+        if has_lstm:
+            directions.append("up" if lstm_prob > 0.5 else "down")
+        if has_cnn:
+            directions.append("up" if cnn_prob  > 0.5 else "down")
 
-        # Determine signal
+        agreement = len(set(directions)) == 1
+
         if ensemble_prob > BULLISH_THRESHOLD and agreement:
             signal     = "BULLISH"
             confidence = (ensemble_prob - 0.5) * 2
@@ -362,30 +378,26 @@ class SignalEngine:
             confidence=confidence,
             xgb_prob=round(xgb_prob, 4),
             lstm_prob=round(lstm_prob, 4),
+            cnn_prob=round(cnn_prob, 4),
             ensemble_prob=round(ensemble_prob, 4),
             agreement=agreement,
             xgb_weight=round(xgb_w, 4),
             lstm_weight=round(lstm_w, 4),
+            cnn_weight=round(cnn_w, 4),
         )
 
     def generate_signals(
         self,
         tickers: list[str] = None,
     ) -> dict[str, TradingSignal]:
-        """
-        Generate signals for all tickers.
-        Returns dict of {ticker: TradingSignal}
-        """
+        """Generate signals for all tickers."""
         tickers = tickers or list(self.xgb_models.keys())
         signals = {}
 
         for ticker in tickers:
             try:
-                sig = self.generate_signal(ticker)
-                signals[ticker] = sig
+                signals[ticker] = self.generate_signal(ticker)
             except Exception as e:
-                log.error(
-                    f"[{ticker}] Signal generation failed: {e}"
-                )
+                log.error(f"[{ticker}] Signal failed: {e}")
 
         return signals
