@@ -42,7 +42,8 @@ class Settings(BaseSettings):
         "CVX",    # Chevron
         "AMD",    # AMD
         "GLD",    # Gold ETF
-        "BTC-USD" # Bitcoin
+        "BTC-USD", # Bitcoin
+        "TSLS"    #Tesla etf
     ]
 
     # Canadian Stocks (Toronto Stock Exchange)
