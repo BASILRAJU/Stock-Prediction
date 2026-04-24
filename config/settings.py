@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     # ── API Keys ──────────────────────────────────────────────
     alpha_vantage_api_key: str = "demo"
     news_api_key: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id:   str = ""
 
     # ── Storage Paths ─────────────────────────────────────────
     data_raw_path: Path = ROOT_DIR / "data" / "raw"
