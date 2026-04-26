@@ -53,10 +53,15 @@ def all_models_exist() -> bool:
 def run_pipeline_if_needed() -> None:
     """Run data pipeline unless features already cached."""
     processed_dir = settings.data_processed_path
-    existing = list(processed_dir.glob("*_features_with_sentiment.parquet"))
+    existing = list(
+        processed_dir.glob("*_features_with_sentiment.parquet")
+    )
 
     if len(existing) >= len(settings.all_tickers) * 0.9:
-        log.info(f"✓ Found {len(existing)} feature files — skipping pipeline")
+        log.info(
+            f"✓ Found {len(existing)} feature files "
+            f"— skipping pipeline"
+        )
         return
 
     log.info("=" * 50)
@@ -71,11 +76,12 @@ def train_ticker_subprocess(ticker: str) -> bool:
     """
     Train one ticker in an isolated subprocess.
     Memory is fully freed when subprocess exits.
+    Output is streamed live to logs so we see progress.
     """
     log.info(f"[{ticker}] Starting training subprocess...")
 
     cmd = [
-        sys.executable, "-c",
+        sys.executable, "-u", "-c",   # -u = unbuffered output
         f"""
 from src.ensemble.ensemble_trainer import train_all_tickers
 train_all_tickers(tickers=['{ticker}'], target_days=5)
@@ -83,24 +89,42 @@ train_all_tickers(tickers=['{ticker}'], target_days=5)
     ]
 
     try:
-        result = subprocess.run(
+        # Stream output live so we can see training progress
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=300,  # 5 min per ticker max
+            bufsize=1,
         )
-        if result.returncode == 0:
+
+        # Stream output line by line in real time
+        try:
+            for line in process.stdout:
+                line = line.rstrip()
+                if line:
+                    log.info(f"[{ticker}] {line}")
+        except Exception as e:
+            log.warning(f"[{ticker}] Stream error: {e}")
+
+        # Wait for completion with timeout
+        try:
+            return_code = process.wait(timeout=900)   # 15 min max
+        except subprocess.TimeoutExpired:
+            process.kill()
+            log.error(f"[{ticker}] ✗ Training timeout (15 min)")
+            return False
+
+        if return_code == 0:
             log.info(f"[{ticker}] ✓ Training complete")
             return True
         else:
             log.error(
-                f"[{ticker}] ✗ Training failed:\n"
-                f"{result.stderr[-500:]}"
+                f"[{ticker}] ✗ Training failed "
+                f"(exit code {return_code})"
             )
             return False
-    except subprocess.TimeoutExpired:
-        log.error(f"[{ticker}] ✗ Training timeout (5 min)")
-        return False
+
     except Exception as e:
         log.error(f"[{ticker}] ✗ Training error: {e}")
         return False
@@ -116,15 +140,24 @@ def train_all_models_safely() -> None:
         return
 
     log.info("=" * 50)
-    log.info(f"STEP 2: Training models for {len(settings.all_tickers)} tickers")
-    log.info("Each ticker trained in isolated subprocess for memory safety")
+    log.info(
+        f"STEP 2: Training models for "
+        f"{len(settings.all_tickers)} tickers"
+    )
+    log.info(
+        "Each ticker trained in isolated subprocess "
+        "(15 min timeout per ticker)"
+    )
     log.info("=" * 50)
 
     success = 0
     failed  = []
 
     for i, ticker in enumerate(settings.all_tickers, 1):
-        log.info(f"({i}/{len(settings.all_tickers)}) Training {ticker}...")
+        log.info(
+            f"({i}/{len(settings.all_tickers)}) "
+            f"Training {ticker}..."
+        )
 
         # Skip if already trained
         xgb_path  = MODELS_DIR / f"xgboost_{ticker}.joblib"
@@ -140,7 +173,10 @@ def train_all_models_safely() -> None:
             failed.append(ticker)
 
     log.info("=" * 50)
-    log.info(f"Training complete: {success}/{len(settings.all_tickers)} succeeded")
+    log.info(
+        f"Training complete: "
+        f"{success}/{len(settings.all_tickers)} succeeded"
+    )
     if failed:
         log.warning(f"Failed tickers: {failed}")
     log.info("=" * 50)
