@@ -3,13 +3,18 @@ src/alerts/live_poller.py
 ──────────────────────────
 Polls news and signals every 15 minutes.
 Sends Telegram alerts when:
-  1. New high-impact news headline appears
-  2. Signal changes direction (neutral → bullish, etc)
+  1. New high-impact news headline appears (RSS + NewsAPI)
+  2. Signal direction changes (neutral → bullish, etc)
   3. Strong signal appears (confidence > threshold)
 
+Smart features:
+  - Only alerts on signal direction CHANGE (not repeated)
+  - 25% confidence minimum (real signals, not noise)
+  - RSS for unlimited news + NewsAPI 4x/day max
+  - Per-headline cooldown to avoid spam
+
 State tracking:
-  We persist the last alerts sent to avoid spam.
-  Same signal won't alert twice within a cooldown window.
+  Persists last alerts to disk to survive restarts.
 
 Design:
   - Runs in infinite loop with 15-minute sleeps
@@ -27,6 +32,7 @@ from pathlib import Path
 from config.settings import settings
 from src.alerts.telegram_bot import TelegramAlerter
 from src.sentiment.news_fetcher import NewsFetcher
+from src.sentiment.rss_news_fetcher import RSSNewsFetcher
 from src.sentiment.finbert_scorer import FinBERTScorer
 from src.ensemble.signal_engine import SignalEngine
 from src.position_calculator import PositionCalculator
@@ -69,25 +75,24 @@ class LivePoller:
 
     def __init__(
         self,
-        capital:              float = 500.0,
-        poll_minutes:         int   = 15,
-        confidence_threshold: float = 0.08,
-        news_alert_threshold: float = 0.75,
-        signal_cooldown_hours: float = 4.0,
-        news_cooldown_hours:   float = 1.0,
+        capital:               float = 500.0,
+        poll_minutes:          int   = 15,
+        confidence_threshold:  float = 0.25,    # balanced mode
+        news_alert_threshold:  float = 0.80,    # only strong news
+        news_cooldown_hours:   float = 6.0,     # same headline silenced 6h
     ):
         self.capital              = capital
         self.poll_minutes         = poll_minutes
         self.confidence_threshold = confidence_threshold
         self.news_alert_threshold = news_alert_threshold
-        self.signal_cooldown      = timedelta(hours=signal_cooldown_hours)
         self.news_cooldown        = timedelta(hours=news_cooldown_hours)
 
-        self.alerter     = TelegramAlerter()
-        self.news        = NewsFetcher()
-        self.scorer      = FinBERTScorer()
-        self.engine      = SignalEngine()
-        self.calculator  = PositionCalculator(
+        self.alerter    = TelegramAlerter()
+        self.news       = NewsFetcher()
+        self.rss        = RSSNewsFetcher()
+        self.scorer     = FinBERTScorer()
+        self.engine     = SignalEngine()
+        self.calculator = PositionCalculator(
             capital=capital, allow_fractional=True
         )
 
@@ -100,9 +105,6 @@ class LivePoller:
         self.state = _load_state()
 
     # ── Helpers ──────────────────────────────────────────────
-
-    def _signal_key(self, ticker: str, signal: str) -> str:
-        return f"signal_{ticker}_{signal}"
 
     def _news_key(self, ticker: str, headline: str) -> str:
         # Use first 60 chars of headline as unique key
@@ -122,6 +124,24 @@ class LivePoller:
         self.state[key] = datetime.now().isoformat()
         _save_state(self.state)
 
+    def _should_poll_newsapi(self) -> bool:
+        """
+        Limit NewsAPI to 4 polls per day (every 6 hours).
+        Free tier = 100 calls/day. With 25 tickers,
+        4 polls × 25 tickers = 100 — exactly the limit.
+        """
+        last = self.state.get("last_newsapi_poll")
+        if not last:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last)
+            hours_since = (
+                datetime.now() - last_dt
+            ).total_seconds() / 3600
+            return hours_since >= 6.0
+        except Exception:
+            return True
+
     # ── One polling cycle ────────────────────────────────────
 
     def poll_once(self) -> dict:
@@ -138,7 +158,7 @@ class LivePoller:
             "skipped": 0,
         }
 
-        # ── Step 1: Check for signal changes ──────────────
+        # ── Step 1: Check for signal direction changes ────
         try:
             signals = self.engine.generate_signals(
                 settings.all_tickers
@@ -168,16 +188,21 @@ class LivePoller:
                 if sig.confidence < self.confidence_threshold:
                     continue
 
-                # Cooldown check
-                key = self._signal_key(ticker, sig.signal)
-                if self._is_recent(key, self.signal_cooldown):
+                # Direction-change check
+                last_direction = self.state.get(
+                    f"last_signal_{ticker}"
+                )
+                if last_direction == sig.signal:
+                    # Same direction as before — skip
                     alerts_sent["skipped"] += 1
                     continue
 
-                rec = recs.get(ticker)
+                rec  = recs.get(ticker)
                 sent = self.alerter.send_signal_alert(sig, rec)
                 if sent:
-                    self._mark_sent(key)
+                    # Track last direction
+                    self.state[f"last_signal_{ticker}"] = sig.signal
+                    _save_state(self.state)
                     alerts_sent["signal"] += 1
                     log.info(
                         f"[{ticker}] ALERT SENT — "
@@ -187,36 +212,67 @@ class LivePoller:
         except Exception as e:
             log.error(f"Signal polling failed: {e}")
 
-        # ── Step 2: Check for breaking news ───────────────
+        # ── Step 2: Breaking news (RSS unlimited + NewsAPI 4x/day) ──
         try:
+            use_newsapi = self._should_poll_newsapi()
+            if use_newsapi:
+                log.info(
+                    "Using NewsAPI this cycle "
+                    "(6h since last call)"
+                )
+            else:
+                log.info(
+                    "Skipping NewsAPI this cycle "
+                    "(rate limit conservation)"
+                )
+
             for ticker in settings.all_tickers:
                 try:
-                    # Fetch latest news (uses cache so this is fast)
-                    articles = self.news.fetch_ticker(
-                        ticker, days=1, use_cache=False
+                    # ALWAYS use RSS (free, unlimited)
+                    rss_articles = self.rss.fetch_ticker(
+                        ticker, hours_back=24
                     )
-                    if not articles:
+
+                    # Optionally use NewsAPI (limited)
+                    api_articles = []
+                    if use_newsapi:
+                        try:
+                            api_articles = self.news.fetch_ticker(
+                                ticker, days=1, use_cache=False
+                            )
+                        except Exception:
+                            pass   # rate limit hit silently
+
+                    # Combine + dedupe by title
+                    all_articles = rss_articles + api_articles
+                    seen_titles  = set()
+                    unique = []
+                    for a in all_articles:
+                        title = a.get("title", "")[:80]
+                        if title and title not in seen_titles:
+                            seen_titles.add(title)
+                            unique.append(a)
+
+                    if not unique:
                         continue
 
-                    # Score all headlines
+                    # Score with FinBERT
                     scored = self.scorer.score_ticker(
-                        ticker, articles,
+                        ticker, unique,
                         use_cache=False,
                         filter_neutral=True,
                     )
 
-                    # Alert on high-confidence non-neutral headlines
+                    # Alert on high-confidence headlines
                     for item in scored:
                         confidence = max(
                             item.get("positive", 0),
                             item.get("negative", 0),
                         )
 
-                        # Must be high confidence
                         if confidence < self.news_alert_threshold:
                             continue
 
-                        # Cooldown check
                         headline = item.get("title", "")
                         key = self._news_key(ticker, headline)
                         if self._is_recent(key, self.news_cooldown):
@@ -234,29 +290,49 @@ class LivePoller:
                             alerts_sent["news"] += 1
                             log.info(
                                 f"[{ticker}] NEWS ALERT — "
-                                f"{item['label']} ({confidence:.1%})"
+                                f"{item['label']} "
+                                f"({confidence:.1%})"
                             )
 
                 except Exception as e:
-                    log.warning(f"[{ticker}] news check failed: {e}")
+                    log.warning(
+                        f"[{ticker}] news check failed: {e}"
+                    )
+
+            if use_newsapi:
+                self.state["last_newsapi_poll"] = (
+                    datetime.now().isoformat()
+                )
+                _save_state(self.state)
 
         except Exception as e:
             log.error(f"News polling failed: {e}")
 
         # Cleanup old state entries (> 48 hours)
         cutoff = datetime.now() - timedelta(hours=48)
-        self.state = {
-            k: v for k, v in self.state.items()
-            if isinstance(v, str)
-            and datetime.fromisoformat(v) > cutoff
-        }
+        cleaned_state = {}
+        for k, v in self.state.items():
+            # Keep direction tracking and meta keys forever
+            if k.startswith("last_signal_") or k == "last_newsapi_poll":
+                cleaned_state[k] = v
+                continue
+            # Time-based cleanup for news/signal keys
+            if isinstance(v, str):
+                try:
+                    if datetime.fromisoformat(v) > cutoff:
+                        cleaned_state[k] = v
+                except Exception:
+                    cleaned_state[k] = v
+            else:
+                cleaned_state[k] = v
+        self.state = cleaned_state
         _save_state(self.state)
 
         log.info(
             f"Poll complete: "
             f"{alerts_sent['signal']} signal alerts, "
             f"{alerts_sent['news']} news alerts, "
-            f"{alerts_sent['skipped']} skipped (cooldown)"
+            f"{alerts_sent['skipped']} skipped"
         )
         return alerts_sent
 
@@ -278,9 +354,11 @@ class LivePoller:
                 f"🚀 <b>Live Poller Started</b>\n\n"
                 f"Polling every {self.poll_minutes} minutes\n"
                 f"Capital: ${self.capital:,.2f}\n"
-                f"Tickers: {len(settings.all_tickers)}\n\n"
-                f"<i>You'll receive alerts when signals or "
-                f"high-confidence news appears.</i>"
+                f"Tickers: {len(settings.all_tickers)}\n"
+                f"Min confidence: "
+                f"{self.confidence_threshold:.0%}\n\n"
+                f"<i>You'll receive alerts when signal "
+                f"direction changes or breaking news appears.</i>"
             )
         except Exception as e:
             log.warning(f"Startup message failed: {e}")
