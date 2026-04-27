@@ -264,19 +264,74 @@ class LivePoller:
                     )
 
                     # Alert on high-confidence headlines
-                    for item in scored:
-                        confidence = max(
-                            item.get("positive", 0),
-                            item.get("negative", 0),
+                    # Aggregate sentiment for this ticker
+                    bullish_count = sum(
+                        1 for item in scored
+                        if item.get("label") == "positive"
+                        and item.get("positive", 0) >= self.news_alert_threshold
+                    )
+                    bearish_count = sum(
+                        1 for item in scored
+                        if item.get("label") == "negative"
+                        and item.get("negative", 0) >= self.news_alert_threshold
+                    )
+
+                    # Need a CLEAR sentiment trend (3+ headlines, 60%+ same direction)
+                    total_strong = bullish_count + bearish_count
+                    if total_strong < 3:
+                        continue   # not enough signal
+
+                    bull_ratio = bullish_count / total_strong if total_strong else 0
+                    bear_ratio = bearish_count / total_strong if total_strong else 0
+
+                    # Determine dominant direction
+                    if bull_ratio >= 0.65:
+                        direction = "BULLISH"
+                        sample_label = "positive"
+                    elif bear_ratio >= 0.65:
+                        direction = "BEARISH"
+                        sample_label = "negative"
+                    else:
+                        continue   # mixed news, skip
+
+                    # Cooldown check (one news alert per ticker per 6 hours)
+                    key = f"news_summary_{ticker}_{direction}"
+                    if self._is_recent(key, self.news_cooldown):
+                        continue
+
+                    # Get a strong representative headline
+                    representative = max(
+                        (item for item in scored
+                         if item.get("label") == sample_label),
+                        key=lambda x: x.get(sample_label, 0),
+                        default=None,
+                    )
+                    if not representative:
+                        continue
+
+                    confidence = representative.get(sample_label, 0)
+                    headline = representative.get("title", "")
+
+                    # Build aggregated headline summary
+                    summary = (
+                        f"[{bullish_count}🟢/{bearish_count}🔴 from "
+                        f"{len(scored)} headlines] {headline}"
+                    )
+
+                    sent = self.alerter.send_news_alert(
+                        ticker=ticker,
+                        headline=summary,
+                        sentiment_label=sample_label,
+                        confidence=confidence,
+                        source=representative.get("source", ""),
+                    )
+                    if sent:
+                        self._mark_sent(key)
+                        alerts_sent["news"] += 1
+                        log.info(
+                            f"[{ticker}] AGGREGATED NEWS ALERT — "
+                            f"{direction} ({bullish_count}/{bearish_count})"
                         )
-
-                        if confidence < self.news_alert_threshold:
-                            continue
-
-                        headline = item.get("title", "")
-                        key = self._news_key(ticker, headline)
-                        if self._is_recent(key, self.news_cooldown):
-                            continue
 
                         sent = self.alerter.send_news_alert(
                             ticker=ticker,
