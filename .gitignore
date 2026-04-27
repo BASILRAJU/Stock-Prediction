@@ -4,8 +4,15 @@ venv/
 # Environment variables - NEVER commit
 .env
 
-# Data files - too large for GitHub
-data/
+# Data files
+data/raw/
+data/cache/
+data/processed/
+data/charts/
+
+# But INCLUDE trained models in git
+!data/models/
+!data/models/**
 
 # Log files
 logs/
