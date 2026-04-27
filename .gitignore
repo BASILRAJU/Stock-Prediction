@@ -7,12 +7,13 @@ venv/
 # Data files
 data/raw/
 data/cache/
-data/processed/
 data/charts/
 
-# But INCLUDE trained models in git
+# INCLUDE trained models AND processed features in git
 !data/models/
 !data/models/**
+!data/processed/
+!data/processed/**
 
 # Log files
 logs/
@@ -23,8 +24,9 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Parquet files
+# Parquet files (but include processed features)
 *.parquet
+!data/processed/*.parquet
 
 # VS Code
 .vscode/

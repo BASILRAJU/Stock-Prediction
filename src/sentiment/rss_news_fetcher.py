@@ -156,11 +156,17 @@ class RSSNewsFetcher:
                     description = re.sub(r"<[^>]+>", "", description)
                     description = description.strip()[:500]
 
+                # Convert datetime to ISO string (JSON-safe)
+                pub_iso = (
+                    published_at.isoformat()
+                    if published_at else None
+                )
+
                 articles.append({
                     "title":        title.strip(),
                     "description":  description or "",
                     "link":         link or "",
-                    "published_at": published_at,
+                    "published_at": pub_iso,
                 })
 
         except ET.ParseError as e:
@@ -199,6 +205,15 @@ class RSSNewsFetcher:
                 # No date — assume recent
                 recent.append(a)
                 continue
+
+            # Parse if string, use if datetime
+            if isinstance(pub, str):
+                try:
+                    pub = datetime.fromisoformat(pub)
+                except Exception:
+                    recent.append(a)   # can't parse, keep it
+                    continue
+
             if pub.tzinfo is None:
                 pub = pub.replace(tzinfo=timezone.utc)
             if pub >= cutoff:
