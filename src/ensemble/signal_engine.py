@@ -5,7 +5,7 @@ Combines XGBoost + LSTM + CNN predictions into a single
 Bullish / Neutral / Bearish trading signal with confidence.
 
 Three specialist models:
-  XGBoost — reads 117 numeric features (tabular patterns)
+  XGBoost — reads tabular features (technical/fundamental)
   LSTM    — reads 60-day sequences (temporal patterns)
   CNN     — reads 30-day chart images (visual patterns)
 
@@ -13,14 +13,14 @@ Dynamic weighting:
   Models weighted by AUC score from training.
   Better model gets more influence on final signal.
 
+Trend filter:
+  Bullish signals blocked if price below 200-MA - 2%
+  Bearish signals blocked if price above 200-MA + 2%
+
 Signal thresholds:
   probability > 0.55  → BULLISH
   probability < 0.45  → BEARISH
   otherwise           → NEUTRAL
-
-Confidence filtering:
-  Only act when models AGREE on direction.
-  Disagreement → NEUTRAL (no trade).
 """
 
 from __future__ import annotations
@@ -81,14 +81,14 @@ class TradingSignal:
 class SignalEngine:
     """
     Loads XGBoost + LSTM + CNN models and generates
-    ensemble trading signals.
+    ensemble trading signals with trend filter.
     """
 
     def __init__(self):
         self.xgb_models:  dict[str, XGBoostModel] = {}
         self.lstm_models: dict[str, LSTMModel]    = {}
-        self.cnn_models:  dict[str, CNNModel]      = {}
-        self.weights:     dict[str, dict]          = {}
+        self.cnn_models:  dict[str, CNNModel]     = {}
+        self.weights:     dict[str, dict]         = {}
         self.chart_gen    = None
         self._load_weights()
 
@@ -130,6 +130,37 @@ class SignalEngine:
             f"Dynamic weights loaded for "
             f"{len(self.weights)} tickers"
         )
+
+    def _check_trend(self, ticker: str) -> tuple[bool, bool]:
+        """
+        Check long-term trend using 200-day MA.
+        Returns (in_uptrend, in_downtrend).
+        Both False if not enough data or no clear trend.
+        """
+        try:
+            data_path = (
+                settings.data_processed_path /
+                f"{ticker}_features_with_sentiment.parquet"
+            )
+            if not data_path.exists():
+                return False, False
+
+            df = pd.read_parquet(data_path)
+            df = df.dropna(subset=["close", "sma_200"])
+            if df.empty:
+                return False, False
+
+            latest = df.iloc[-1]
+            close  = latest["close"]
+            sma200 = latest["sma_200"]
+
+            in_uptrend   = close > sma200 * 1.02
+            in_downtrend = close < sma200 * 0.98
+
+            return bool(in_uptrend), bool(in_downtrend)
+        except Exception as e:
+            log.warning(f"[{ticker}] Trend check failed: {e}")
+            return False, False
 
     def load_models(self, tickers: list[str] = None) -> None:
         """Load XGBoost + LSTM + CNN models from disk."""
@@ -178,7 +209,8 @@ class SignalEngine:
 
             if models_loaded:
                 log.info(
-                    f"[{ticker}] Loaded: {', '.join(models_loaded)} | "
+                    f"[{ticker}] Loaded: "
+                    f"{', '.join(models_loaded)} | "
                     f"weights xgb={w['xgboost']:.2f} "
                     f"lstm={w['lstm']:.2f} "
                     f"cnn={w['cnn']:.2f}"
@@ -210,7 +242,11 @@ class SignalEngine:
 
         exclude = {
             "open", "high", "low", "close",
-            "volume", "ticker",
+            "volume", "ticker", "target",
+            "sma_10", "sma_20", "sma_50", "sma_200",
+            "ema_9", "ema_21", "ema_55",
+            "vp_poc", "vp_val_high", "vp_val_low",
+            "obv_ema", "force_index_ema", "vol_sma_20",
         }
 
         # ── XGBoost features ──────────────────────────────────
@@ -263,7 +299,7 @@ class SignalEngine:
                     ["open", "high", "low", "close", "volume"]
                 ].dropna().iloc[-30:]
                 img = self.chart_gen.ohlcv_to_image(window_df)
-                cnn_X = img.transpose(2, 0, 1)  # (3, 224, 224)
+                cnn_X = img.transpose(2, 0, 1)
             except Exception as e:
                 log.warning(f"[{ticker}] CNN image failed: {e}")
 
@@ -349,7 +385,7 @@ class SignalEngine:
             cnn_w  * cnn_prob
         )
 
-        # Agreement — all available models point same direction
+        # Agreement check
         directions = []
         if has_xgb:
             directions.append("up" if xgb_prob  > 0.5 else "down")
@@ -360,12 +396,23 @@ class SignalEngine:
 
         agreement = len(set(directions)) == 1
 
+        # Trend filter
+        in_uptrend, in_downtrend = self._check_trend(ticker)
+
         if ensemble_prob > BULLISH_THRESHOLD and agreement:
-            signal     = "BULLISH"
-            confidence = (ensemble_prob - 0.5) * 2
+            if in_downtrend:
+                signal     = "NEUTRAL"
+                confidence = 0.0
+            else:
+                signal     = "BULLISH"
+                confidence = (ensemble_prob - 0.5) * 2
         elif ensemble_prob < BEARISH_THRESHOLD and agreement:
-            signal     = "BEARISH"
-            confidence = (0.5 - ensemble_prob) * 2
+            if in_uptrend:
+                signal     = "NEUTRAL"
+                confidence = 0.0
+            else:
+                signal     = "BEARISH"
+                confidence = (0.5 - ensemble_prob) * 2
         else:
             signal     = "NEUTRAL"
             confidence = abs(ensemble_prob - 0.5) * 2

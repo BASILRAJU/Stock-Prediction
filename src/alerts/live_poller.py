@@ -2,12 +2,13 @@
 src/alerts/live_poller.py
 ──────────────────────────
 Polls news and signals every 15 minutes.
-Sends Telegram alerts when:
+Sends Telegram alerts with annotated charts when:
   1. New high-impact news headline appears (RSS + NewsAPI)
   2. Signal direction changes (neutral → bullish, etc)
   3. Strong signal appears (confidence > threshold)
 
 Smart features:
+  - Annotated charts with S/R, POC, MAs, entry/stop/target
   - Only alerts on signal direction CHANGE (not repeated)
   - 25% confidence minimum (real signals, not noise)
   - RSS for unlimited news + NewsAPI 4x/day max
@@ -15,11 +16,6 @@ Smart features:
 
 State tracking:
   Persists last alerts to disk to survive restarts.
-
-Design:
-  - Runs in infinite loop with 15-minute sleeps
-  - Safe to kill and restart (state saved to disk)
-  - Logs all alerts for audit
 """
 
 from __future__ import annotations
@@ -29,16 +25,18 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pandas as pd
+
 from config.settings import settings
 from src.alerts.telegram_bot import TelegramAlerter
+from src.alerts.chart_annotator import generate_alert_chart
 from src.sentiment.news_fetcher import NewsFetcher
 from src.sentiment.rss_news_fetcher import RSSNewsFetcher
 from src.sentiment.finbert_scorer import FinBERTScorer
 from src.ensemble.signal_engine import SignalEngine
 from src.position_calculator import PositionCalculator
+from src.ingestion.yfinance_fetcher import YFinanceFetcher
 from src.utils.logger import log
-
-import pandas as pd
 
 
 # ─── State persistence ────────────────────────────────────────
@@ -66,26 +64,24 @@ def _save_state(state: dict) -> None:
 
 class LivePoller:
     """
-    Background poller that checks for new signals every N minutes.
-
-    Usage:
-        poller = LivePoller(capital=500, poll_minutes=15)
-        poller.run_forever()
+    Background poller with annotated chart alerts.
     """
 
     def __init__(
         self,
         capital:               float = 500.0,
         poll_minutes:          int   = 15,
-        confidence_threshold:  float = 0.25,    # balanced mode
-        news_alert_threshold:  float = 0.80,    # only strong news
-        news_cooldown_hours:   float = 6.0,     # same headline silenced 6h
+        confidence_threshold:  float = 0.25,
+        news_alert_threshold:  float = 0.80,
+        news_cooldown_hours:   float = 6.0,
+        send_charts:           bool  = True,
     ):
         self.capital              = capital
         self.poll_minutes         = poll_minutes
         self.confidence_threshold = confidence_threshold
         self.news_alert_threshold = news_alert_threshold
         self.news_cooldown        = timedelta(hours=news_cooldown_hours)
+        self.send_charts          = send_charts
 
         self.alerter    = TelegramAlerter()
         self.news       = NewsFetcher()
@@ -95,19 +91,17 @@ class LivePoller:
         self.calculator = PositionCalculator(
             capital=capital, allow_fractional=True
         )
+        self.fetcher    = YFinanceFetcher()
 
-        # Load models once
         log.info("Loading all trained models...")
         self.engine.load_models(settings.all_tickers)
         log.info("Poller ready.")
 
-        # State
         self.state = _load_state()
 
     # ── Helpers ──────────────────────────────────────────────
 
     def _news_key(self, ticker: str, headline: str) -> str:
-        # Use first 60 chars of headline as unique key
         return f"news_{ticker}_{headline[:60]}"
 
     def _is_recent(self, key: str, cooldown: timedelta) -> bool:
@@ -125,11 +119,6 @@ class LivePoller:
         _save_state(self.state)
 
     def _should_poll_newsapi(self) -> bool:
-        """
-        Limit NewsAPI to 4 polls per day (every 6 hours).
-        Free tier = 100 calls/day. With 25 tickers,
-        4 polls × 25 tickers = 100 — exactly the limit.
-        """
         last = self.state.get("last_newsapi_poll")
         if not last:
             return True
@@ -142,13 +131,111 @@ class LivePoller:
         except Exception:
             return True
 
+    def _detect_patterns_for_ticker(self, ticker: str) -> list:
+        """
+        Get currently-detected patterns for the latest day.
+        Reads from feature parquet to find active candlestick flags.
+        """
+        try:
+            path = (
+                settings.data_processed_path /
+                f"{ticker}_features_with_sentiment.parquet"
+            )
+            if not path.exists():
+                return []
+
+            df = pd.read_parquet(path)
+            if df.empty:
+                return []
+
+            latest = df.iloc[-1]
+
+            # Pattern columns to check
+            pattern_map = {
+                "cdl_engulfing_bull":  "bullish_engulfing",
+                "cdl_engulfing_bear":  "bearish_engulfing",
+                "cdl_hammer":          "hammer",
+                "cdl_shooting_star":   "shooting_star",
+                "cdl_three_soldiers":  "three_white_soldiers",
+                "cdl_three_crows":     "three_black_crows",
+                "cdl_morning_star":    "morning_star",
+                "cdl_evening_star":    "evening_star",
+                "cdl_doji":            "doji",
+                "lq_swept_high":       "liquidity_sweep_high",
+                "lq_swept_low":        "liquidity_sweep_low",
+                "lq_sweep_reversal":   "sweep_reversal",
+                "lq_bullish_ob":       "bullish_order_block",
+                "lq_bearish_ob":       "bearish_order_block",
+            }
+
+            active = []
+            for col, name in pattern_map.items():
+                val = latest.get(col, 0)
+                if val and val != 0 and not pd.isna(val):
+                    active.append(name)
+
+            return active[:4]  # max 4 to keep title clean
+
+        except Exception as e:
+            log.warning(f"[{ticker}] Pattern detection failed: {e}")
+            return []
+
+    def _generate_chart_for_alert(
+        self,
+        ticker:         str,
+        signal,
+        recommendation,
+    ) -> bytes:
+        """Generate annotated chart image for the alert."""
+        try:
+            # Get raw OHLCV
+            raw_df = self.fetcher.fetch_daily(
+                ticker, use_cache=True
+            )
+            if raw_df.empty:
+                return None
+
+            # Get current trade levels
+            entry  = (
+                recommendation.entry_price
+                if recommendation else float(raw_df["close"].iloc[-1])
+            )
+            stop   = (
+                recommendation.stop_loss
+                if recommendation else None
+            )
+            tgt1   = (
+                recommendation.target_1
+                if recommendation else None
+            )
+            tgt2   = (
+                recommendation.target_2
+                if recommendation else None
+            )
+
+            patterns = self._detect_patterns_for_ticker(ticker)
+
+            chart_bytes = generate_alert_chart(
+                ticker=ticker,
+                df=raw_df,
+                signal=signal.signal,
+                confidence=signal.confidence,
+                entry_price=entry,
+                stop_loss=stop,
+                target_1=tgt1,
+                target_2=tgt2,
+                detected_patterns=patterns,
+                window_days=30,
+            )
+            return chart_bytes
+
+        except Exception as e:
+            log.error(f"[{ticker}] Chart for alert failed: {e}")
+            return None
+
     # ── One polling cycle ────────────────────────────────────
 
     def poll_once(self) -> dict:
-        """
-        Run one polling cycle.
-        Returns counts of alerts sent.
-        """
         log.info("=" * 50)
         log.info(f"Poll cycle starting at {datetime.now()}")
 
@@ -158,13 +245,12 @@ class LivePoller:
             "skipped": 0,
         }
 
-        # ── Step 1: Check for signal direction changes ────
+        # ── Step 1: Signal direction changes ────────────────
         try:
             signals = self.engine.generate_signals(
                 settings.all_tickers
             )
 
-            # Load features for position sizing
             features_dict = {}
             for ticker in settings.all_tickers:
                 path = (
@@ -174,66 +260,63 @@ class LivePoller:
                 if path.exists():
                     features_dict[ticker] = pd.read_parquet(path)
 
-            # Calculate positions
             recs = self.calculator.calculate_portfolio(
                 signals, features_dict
             )
 
             for ticker, sig in signals.items():
-                # Skip neutral signals
                 if sig.signal == "NEUTRAL":
                     continue
 
-                # Skip low-confidence signals
                 if sig.confidence < self.confidence_threshold:
                     continue
 
-                # Direction-change check
                 last_direction = self.state.get(
                     f"last_signal_{ticker}"
                 )
                 if last_direction == sig.signal:
-                    # Same direction as before — skip
                     alerts_sent["skipped"] += 1
                     continue
 
-                rec  = recs.get(ticker)
-                sent = self.alerter.send_signal_alert(sig, rec)
+                rec = recs.get(ticker)
+
+                # Generate annotated chart
+                chart_bytes = None
+                if self.send_charts:
+                    chart_bytes = self._generate_chart_for_alert(
+                        ticker, sig, rec
+                    )
+
+                sent = self.alerter.send_signal_alert(
+                    sig, rec, chart_image=chart_bytes,
+                )
                 if sent:
-                    # Track last direction
                     self.state[f"last_signal_{ticker}"] = sig.signal
                     _save_state(self.state)
                     alerts_sent["signal"] += 1
                     log.info(
                         f"[{ticker}] ALERT SENT — "
-                        f"{sig.signal} ({sig.confidence:.1%})"
+                        f"{sig.signal} ({sig.confidence:.1%}) "
+                        f"{'[with chart]' if chart_bytes else '[text only]'}"
                     )
 
         except Exception as e:
             log.error(f"Signal polling failed: {e}")
 
-        # ── Step 2: Breaking news (RSS unlimited + NewsAPI 4x/day) ──
+        # ── Step 2: Breaking news ───────────────────────────
         try:
             use_newsapi = self._should_poll_newsapi()
             if use_newsapi:
-                log.info(
-                    "Using NewsAPI this cycle "
-                    "(6h since last call)"
-                )
+                log.info("Using NewsAPI this cycle (6h since last)")
             else:
-                log.info(
-                    "Skipping NewsAPI this cycle "
-                    "(rate limit conservation)"
-                )
+                log.info("Skipping NewsAPI (rate limit conservation)")
 
             for ticker in settings.all_tickers:
                 try:
-                    # ALWAYS use RSS (free, unlimited)
                     rss_articles = self.rss.fetch_ticker(
                         ticker, hours_back=24
                     )
 
-                    # Optionally use NewsAPI (limited)
                     api_articles = []
                     if use_newsapi:
                         try:
@@ -241,9 +324,8 @@ class LivePoller:
                                 ticker, days=1, use_cache=False
                             )
                         except Exception:
-                            pass   # rate limit hit silently
+                            pass
 
-                    # Combine + dedupe by title
                     all_articles = rss_articles + api_articles
                     seen_titles  = set()
                     unique = []
@@ -256,15 +338,12 @@ class LivePoller:
                     if not unique:
                         continue
 
-                    # Score with FinBERT
                     scored = self.scorer.score_ticker(
                         ticker, unique,
                         use_cache=False,
                         filter_neutral=True,
                     )
 
-                    # Alert on high-confidence headlines
-                    # Aggregate sentiment for this ticker
                     bullish_count = sum(
                         1 for item in scored
                         if item.get("label") == "positive"
@@ -276,15 +355,19 @@ class LivePoller:
                         and item.get("negative", 0) >= self.news_alert_threshold
                     )
 
-                    # Need a CLEAR sentiment trend (3+ headlines, 60%+ same direction)
                     total_strong = bullish_count + bearish_count
                     if total_strong < 3:
-                        continue   # not enough signal
+                        continue
 
-                    bull_ratio = bullish_count / total_strong if total_strong else 0
-                    bear_ratio = bearish_count / total_strong if total_strong else 0
+                    bull_ratio = (
+                        bullish_count / total_strong
+                        if total_strong else 0
+                    )
+                    bear_ratio = (
+                        bearish_count / total_strong
+                        if total_strong else 0
+                    )
 
-                    # Determine dominant direction
                     if bull_ratio >= 0.65:
                         direction = "BULLISH"
                         sample_label = "positive"
@@ -292,14 +375,12 @@ class LivePoller:
                         direction = "BEARISH"
                         sample_label = "negative"
                     else:
-                        continue   # mixed news, skip
+                        continue
 
-                    # Cooldown check (one news alert per ticker per 6 hours)
                     key = f"news_summary_{ticker}_{direction}"
                     if self._is_recent(key, self.news_cooldown):
                         continue
 
-                    # Get a strong representative headline
                     representative = max(
                         (item for item in scored
                          if item.get("label") == sample_label),
@@ -312,7 +393,6 @@ class LivePoller:
                     confidence = representative.get(sample_label, 0)
                     headline = representative.get("title", "")
 
-                    # Build aggregated headline summary
                     summary = (
                         f"[{bullish_count}🟢/{bearish_count}🔴 from "
                         f"{len(scored)} headlines] {headline}"
@@ -329,25 +409,10 @@ class LivePoller:
                         self._mark_sent(key)
                         alerts_sent["news"] += 1
                         log.info(
-                            f"[{ticker}] AGGREGATED NEWS ALERT — "
-                            f"{direction} ({bullish_count}/{bearish_count})"
+                            f"[{ticker}] NEWS ALERT — "
+                            f"{direction} "
+                            f"({bullish_count}/{bearish_count})"
                         )
-
-                        sent = self.alerter.send_news_alert(
-                            ticker=ticker,
-                            headline=headline,
-                            sentiment_label=item["label"],
-                            confidence=confidence,
-                            source=item.get("source", ""),
-                        )
-                        if sent:
-                            self._mark_sent(key)
-                            alerts_sent["news"] += 1
-                            log.info(
-                                f"[{ticker}] NEWS ALERT — "
-                                f"{item['label']} "
-                                f"({confidence:.1%})"
-                            )
 
                 except Exception as e:
                     log.warning(
@@ -363,15 +428,16 @@ class LivePoller:
         except Exception as e:
             log.error(f"News polling failed: {e}")
 
-        # Cleanup old state entries (> 48 hours)
+        # Cleanup old state
         cutoff = datetime.now() - timedelta(hours=48)
         cleaned_state = {}
         for k, v in self.state.items():
-            # Keep direction tracking and meta keys forever
-            if k.startswith("last_signal_") or k == "last_newsapi_poll":
+            if (
+                k.startswith("last_signal_") or
+                k == "last_newsapi_poll"
+            ):
                 cleaned_state[k] = v
                 continue
-            # Time-based cleanup for news/signal keys
             if isinstance(v, str):
                 try:
                     if datetime.fromisoformat(v) > cutoff:
@@ -391,19 +457,14 @@ class LivePoller:
         )
         return alerts_sent
 
-    # ── Continuous polling loop ──────────────────────────────
+    # ── Continuous loop ─────────────────────────────────────
 
     def run_forever(self) -> None:
-        """
-        Run polling loop indefinitely.
-        Sleeps poll_minutes between cycles.
-        """
         log.info(
             f"Starting live poller — "
             f"polling every {self.poll_minutes} minutes"
         )
 
-        # Send startup message
         try:
             self.alerter.send_text(
                 f"🚀 <b>Live Poller Started</b>\n\n"
@@ -411,9 +472,11 @@ class LivePoller:
                 f"Capital: ${self.capital:,.2f}\n"
                 f"Tickers: {len(settings.all_tickers)}\n"
                 f"Min confidence: "
-                f"{self.confidence_threshold:.0%}\n\n"
-                f"<i>You'll receive alerts when signal "
-                f"direction changes or breaking news appears.</i>"
+                f"{self.confidence_threshold:.0%}\n"
+                f"Charts: "
+                f"{'ENABLED 📊' if self.send_charts else 'DISABLED'}\n\n"
+                f"<i>You'll receive annotated chart alerts when "
+                f"signal direction changes or breaking news appears.</i>"
             )
         except Exception as e:
             log.warning(f"Startup message failed: {e}")
@@ -437,5 +500,9 @@ class LivePoller:
 
 
 if __name__ == "__main__":
-    poller = LivePoller(capital=500.0, poll_minutes=15)
+    poller = LivePoller(
+        capital=500.0,
+        poll_minutes=15,
+        send_charts=True,
+    )
     poller.run_forever()

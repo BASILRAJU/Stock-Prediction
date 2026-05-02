@@ -34,3 +34,6 @@ __pycache__/
 # Windows
 Thumbs.db
 desktop.ini
+# Chart caches — regenerated locally, too big for git
+data/charts/
+data/charts_annotated/

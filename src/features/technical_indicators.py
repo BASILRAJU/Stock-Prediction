@@ -33,6 +33,9 @@ except ImportError:
 
 from config.settings import settings
 from src.utils.logger import log
+from src.features.volume_profile import calculate_volume_profile
+from src.features.liquidity_zones import calculate_liquidity_features
+from src.features.multi_timeframe import calculate_mtf_features
 
 # Return horizons in trading days
 RETURN_HORIZONS = [1, 3, 5, 10, 20]
@@ -77,13 +80,16 @@ class TechnicalFeatureEngine:
 
         # Build each feature group
         groups = [
-            ("Trend",      self._trend(df)),
-            ("Momentum",   self._momentum(df)),
-            ("Volatility", self._volatility(df)),
-            ("Volume",     self._volume(df)),
-            ("Returns",    self._returns(df)),
-            ("Patterns",   self._patterns(df)),
-            ("Regime",     self._regime(df)),
+            ("Trend",          self._trend(df)),
+            ("Momentum",       self._momentum(df)),
+            ("Volatility",     self._volatility(df)),
+            ("Volume",         self._volume(df)),
+            ("VolumeProfile",  self._volume_profile(df)),
+            ("Liquidity",      self._liquidity(df)),
+            ("MultiTimeframe", self._mtf(df)),
+            ("Returns",        self._returns(df)),
+            ("Patterns",       self._patterns(df)),
+            ("Regime",         self._regime(df)),
         ]
 
         # Start with OHLCV columns
@@ -341,6 +347,79 @@ class TechnicalFeatureEngine:
         f["force_index_ema"] = ta.ema(f["force_index"], length=13)
 
         return f
+
+        # ── Volume Profile Features ───────────────────────────────
+
+    def _volume_profile(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add institutional Volume Profile features.
+
+        Calculates rolling 20-day volume profile and extracts:
+          - POC (Point of Control) — highest-volume price level
+          - Value Area High/Low — 70% volume zone boundaries
+          - HVN above/below — high-volume support/resistance flags
+          - Distance metrics to all key levels
+
+        These are the levels institutions watch for entries/exits.
+        """
+        try:
+            result = calculate_volume_profile(
+                df, lookback_days=20, n_bins=20
+            )
+            # Extract just the new vp_* columns
+            vp_cols = [
+                c for c in result.columns
+                if c.startswith("vp_")
+            ]
+            return result[vp_cols].copy()
+        except Exception as e:
+            log.warning(f"Volume Profile failed: {e}")
+            return pd.DataFrame(index=df.index)
+
+    # ── Liquidity Zone Features ───────────────────────────────
+
+    def _liquidity(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add liquidity / smart money features.
+
+        Detects:
+          - Stop hunt zones (sweep patterns)
+          - Order blocks (institutional supply/demand)
+          - Round number levels (psychological)
+          - Equal highs/lows (obvious targets)
+          - Sweep + reversal (Wyckoff Spring/Upthrust)
+        """
+        try:
+            result = calculate_liquidity_features(df, lookback=20)
+            lq_cols = [
+                c for c in result.columns
+                if c.startswith("lq_")
+            ]
+            return result[lq_cols].copy()
+        except Exception as e:
+            log.warning(f"Liquidity features failed: {e}")
+            return pd.DataFrame(index=df.index)    
+
+    # ── Multi-Timeframe Features ──────────────────────────────
+
+    def _mtf(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add multi-timeframe alignment features.
+
+        Provides weekly/monthly context for daily signals.
+        Strong signals require multi-timeframe alignment.
+        """
+        try:
+            result = calculate_mtf_features(df)
+            mtf_cols = [
+                "weekly_trend_up", "weekly_rsi", "weekly_pct_change",
+                "monthly_trend_up", "monthly_rsi", "monthly_pct_change",
+                "mtf_alignment", "mtf_strength",
+            ]
+            return result[mtf_cols].copy()
+        except Exception as e:
+            log.warning(f"MTF features failed: {e}")
+            return pd.DataFrame(index=df.index)            
 
     # ── Return Features ───────────────────────────────────────
 

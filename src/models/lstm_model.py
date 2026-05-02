@@ -145,8 +145,16 @@ class LSTMModel(BaseStockModel):
         df = df.dropna(subset=["target"])
 
         exclude = {
+            # Price columns
             "open", "high", "low", "close", "volume",
             "ticker", "target",
+            # Raw moving averages (use price_to_sma_X relative distances instead)
+            "sma_10", "sma_20", "sma_50", "sma_200",
+            "ema_9", "ema_21", "ema_55",
+            # Raw volume profile levels (use vp_dist_to_X relative distances instead)
+            "vp_poc", "vp_val_high", "vp_val_low",
+            # Raw volume/momentum aggregates (use relative versions)
+            "obv_ema", "force_index_ema", "vol_sma_20",
         }
         self.feature_cols = [
             c for c in df.columns

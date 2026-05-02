@@ -1,22 +1,28 @@
 """
 src/ensemble/ensemble_trainer.py
 ──────────────────────────────────
-Trains XGBoost + LSTM for all 12 tickers and saves
+Trains XGBoost + LSTM + CNN for all tickers and saves
 their results to disk for the signal engine to use.
 
 Design:
-  Each ticker gets its own pair of models trained
+  Each ticker gets its own trio of models trained
   independently on that ticker's feature history.
-  This is ticker-specific training — AAPL's model
-  learns AAPL patterns, not general market patterns.
+  This is ticker-specific training — AAPL's models
+  learn AAPL patterns, not general market patterns.
+
+Three model types:
+  XGBoost — reads 117 numeric features (tabular patterns)
+  LSTM    — reads 60-day sequences (temporal patterns)
+  CNN     — reads 30-day chart images (visual patterns)
 
 Output per ticker:
   data/models/xgboost_{ticker}.joblib
   data/models/lstm_{ticker}.pt
+  data/models/cnn_{ticker}.pt
   data/models/ensemble_results.json   ← accuracy scores
 
 Research basis:
-  Dynamic ensemble weighting by Sharpe ratio
+  Dynamic ensemble weighting by Sharpe/AUC
   (TradingAgents arXiv:2412.20138, 2024).
   Models weighted by recent out-of-sample performance,
   not fixed equal weights.
@@ -35,7 +41,10 @@ from rich.table import Table
 from config.settings import settings
 from src.models.xgboost_model import XGBoostModel
 from src.models.lstm_model import LSTMModel
+from src.models.cnn_model import CNNModel
+from src.models.chart_generator import ChartGenerator
 from src.models.base_model import MODELS_DIR
+from src.ingestion.yfinance_fetcher import YFinanceFetcher
 from src.utils.logger import log
 
 console = Console()
@@ -47,29 +56,43 @@ def train_all_tickers(
     tickers: list[str] = None,
     target_days: int = 5,
     skip_existing: bool = False,
+    train_cnn: bool = True,
 ) -> dict:
     """
-    Train XGBoost + LSTM for every ticker.
+    Train XGBoost + LSTM + CNN for every ticker.
 
     Args:
-        tickers:       List of tickers (defaults to all 12)
+        tickers:       List of tickers (defaults to all)
         target_days:   Prediction horizon in trading days
         skip_existing: Skip tickers that already have saved models
+        train_cnn:     Whether to train CNN (set False for fast retraining
+                       without chart-based model)
 
     Returns:
-        Dict of {ticker: {xgboost: metrics, lstm: metrics}}
+        Dict of {ticker: {xgboost: metrics, lstm: metrics, cnn: metrics}}
     """
-    tickers = tickers or settings.all_tickers
-    all_results = {}
+    tickers      = tickers or settings.all_tickers
+    all_results  = {}
+
+    # Load existing results so we don't overwrite (allows incremental updates)
+    if RESULTS_FILE.exists():
+        try:
+            with open(RESULTS_FILE) as f:
+                all_results = json.load(f)
+        except Exception:
+            all_results = {}
 
     console.print(
         f"\n[bold cyan]Phase 4 — Ensemble Trainer[/bold cyan]\n"
-        f"Training XGBoost + LSTM for {len(tickers)} tickers\n"
+        f"Training XGBoost + LSTM"
+        f"{' + CNN' if train_cnn else ''}"
+        f" for {len(tickers)} tickers\n"
         f"Prediction horizon: {target_days} trading days\n"
         f"Models saved to: {MODELS_DIR}\n"
     )
 
     total_start = time.time()
+    fetcher     = YFinanceFetcher() if train_cnn else None
 
     for i, ticker in enumerate(tickers, 1):
         console.print(
@@ -98,7 +121,7 @@ def train_all_tickers(
             f"{df.shape[1]} features[/dim]"
         )
 
-        ticker_results = {}
+        ticker_results = all_results.get(ticker, {})
 
         # ── XGBoost ───────────────────────────────────────────
         xgb_path = MODELS_DIR / f"xgboost_{ticker}.joblib"
@@ -162,12 +185,77 @@ def train_all_tickers(
                 )
                 log.error(f"[{ticker}] LSTM training failed: {e}")
 
+        # ── CNN ───────────────────────────────────────────────
+        if train_cnn:
+            cnn_path = MODELS_DIR / f"cnn_{ticker}.pt"
+            if skip_existing and cnn_path.exists():
+                console.print(
+                    f"  [dim]CNN: skipping (model exists)[/dim]"
+                )
+            else:
+                try:
+                    t0 = time.time()
+
+                    # CNN needs raw OHLCV, not feature DataFrame
+                    raw_df = fetcher.fetch_daily(
+                        ticker, use_cache=True
+                    )
+
+                    # Generate chart images + patterns
+                    gen = ChartGenerator(window_days=30)
+                    images, labels, dates, patterns = gen.generate_dataset(
+                        ticker, raw_df, target_days=target_days,
+                        use_cache=True,
+                    )
+
+                    if len(images) == 0:
+                        raise ValueError("No chart images generated")
+
+                    console.print(
+                        f"  [dim]Generated {len(images)} chart "
+                        f"images ({labels.sum()}/{len(labels)} "
+                        f"bullish)[/dim]"
+                    )
+
+                    # Train CNN with pattern labels (multi-task)
+                    cnn = CNNModel(
+                        ticker, target_days=target_days,
+                        max_epochs=30, patience=8,
+                    )
+                    cnn.train_on_images(images, labels, patterns)
+
+                    # Evaluate + save
+                    m = cnn.evaluate_on_images(
+                        images, labels, dates
+                    )
+                    cnn.save()
+                    duration = round(time.time() - t0, 1)
+
+                    ticker_results["cnn"] = m
+                    status = (
+                        "[green]✓[/green]" if m["accuracy"] > 0.52
+                        else "[yellow]~[/yellow]"
+                    )
+                    console.print(
+                        f"  {status} CNN:     "
+                        f"accuracy={m['accuracy']:.1%} | "
+                        f"auc={m['auc_roc']:.3f} | "
+                        f"{duration}s"
+                    )
+
+                except Exception as e:
+                    console.print(
+                        f"  [red]✗[/red] CNN failed: {e}"
+                    )
+                    log.error(
+                        f"[{ticker}] CNN training failed: {e}"
+                    )
+
         all_results[ticker] = ticker_results
 
-    # ── Save results to disk ──────────────────────────────────
-    with open(RESULTS_FILE, "w") as f:
-        json.dump(all_results, f, indent=2)
-    log.info(f"Results saved → {RESULTS_FILE}")
+        # Save incrementally after each ticker (resume-safe)
+        with open(RESULTS_FILE, "w") as f:
+            json.dump(all_results, f, indent=2)
 
     # ── Summary table ─────────────────────────────────────────
     total_duration = round(time.time() - total_start, 1)
@@ -177,14 +265,19 @@ def train_all_tickers(
         show_header=True,
         header_style="bold",
     )
-    table.add_column("Ticker",   style="cyan", width=10)
-    table.add_column("XGBoost",  width=16)
-    table.add_column("LSTM",     width=16)
-    table.add_column("Best",     width=10)
+    table.add_column("Ticker",  style="cyan", width=10)
+    table.add_column("XGBoost", width=16)
+    table.add_column("LSTM",    width=16)
+    table.add_column("CNN",     width=16)
+    table.add_column("Best",    width=10)
 
     for ticker, results in all_results.items():
+        if ticker not in tickers:
+            continue   # only show tickers we just trained
+
         xgb_str  = "—"
         lstm_str = "—"
+        cnn_str  = "—"
         best_acc = 0.0
 
         if "xgboost" in results:
@@ -201,13 +294,20 @@ def train_all_tickers(
             lstm_str = f"[{col}]{acc:.1%}[/{col}] / {auc:.3f}"
             best_acc = max(best_acc, acc)
 
+        if "cnn" in results:
+            acc = results["cnn"]["accuracy"]
+            auc = results["cnn"]["auc_roc"]
+            col = "green" if acc > 0.52 else "yellow"
+            cnn_str  = f"[{col}]{acc:.1%}[/{col}] / {auc:.3f}"
+            best_acc = max(best_acc, acc)
+
         best_str = (
             f"[green]{best_acc:.1%}[/green]"
             if best_acc > 0.52
             else f"[yellow]{best_acc:.1%}[/yellow]"
         )
 
-        table.add_row(ticker, xgb_str, lstm_str, best_str)
+        table.add_row(ticker, xgb_str, lstm_str, cnn_str, best_str)
 
     console.print(f"\n")
     console.print(table)
