@@ -34,25 +34,50 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # ── Your Tickers ──────────────────────────────────────────
-    # US Stocks
+    # US Stocks (22 tickers)
     us_tickers: list[str] = [
+        # Tier 1 — Mega-Cap Tech (7)
         "AAPL",   # Apple
         "MSFT",   # Microsoft
         "NVDA",   # Nvidia
+        "GOOGL",  # Alphabet
+        "META",   # Meta
+        "AMZN",   # Amazon
         "TSLA",   # Tesla
-        "SPY",    # S&P 500 ETF
-        "CVX",    # Chevron
+
+        # Tier 2 — Semi Infrastructure (4)
+        "AVGO",   # Broadcom
         "AMD",    # AMD
+        "ASML",   # ASML
+        "AMAT",   # Applied Materials
+
+        # Tier 3 — Financials & Payments (3)
+        "JPM",    # JPMorgan
+        "GS",     # Goldman Sachs
+        "V",      # Visa
+
+        # Tier 4 — US Energy (2)
+        "XOM",    # ExxonMobil
+        "CVX",    # Chevron
+
+        # Tier 5 — Defensive / Hedges (3)
         "GLD",    # Gold ETF
+        "ETR",    # Entergy (utility)
+        "SPY",    # S&P 500 ETF
+
+        # Tier 6 — Speculation (2)
+        "PLTR",   # Palantir
         "BTC-USD", # Bitcoin
-        "TSLS"    #Tesla etf
     ]
 
-    # Canadian Stocks (Toronto Stock Exchange)
+    # Canadian Stocks - Toronto Stock Exchange (5 tickers)
     ca_tickers: list[str] = [
-        "DOL.TO",  # Dollarama
-        "VFV.TO",  # Vanguard S&P 500 ETF (CAD)
         "CSU.TO",  # Constellation Software
+        "BN.TO",   # Brookfield Corp
+        "ATD.TO",  # Couche-Tard
+        "ENB.TO",  # Enbridge
+        "CNQ.TO",  # Canadian Natural Resources
+        "VFV.TO",  # Vanguard S&P 500 ETF (CAD)
     ]
 
     @property
