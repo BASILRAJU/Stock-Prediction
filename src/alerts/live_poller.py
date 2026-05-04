@@ -268,13 +268,33 @@ class LivePoller:
                 if sig.signal == "NEUTRAL":
                     continue
 
-                if sig.confidence < self.confidence_threshold:
-                    continue
-
-                last_direction = self.state.get(
+                # Check if direction changed OR confidence just crossed threshold
+                last_direction  = self.state.get(
                     f"last_signal_{ticker}"
                 )
-                if last_direction == sig.signal:
+                last_confidence = float(self.state.get(
+                    f"last_confidence_{ticker}", 0.0
+                ))
+
+                # Was confidence BELOW threshold last time, now ABOVE?
+                crossed_threshold = (
+                    last_confidence < self.confidence_threshold and
+                    sig.confidence >= self.confidence_threshold
+                )
+
+                # Skip current signal if it's below threshold
+                if sig.confidence < self.confidence_threshold:
+                    # Still update state so we track it for next crossover
+                    self.state[f"last_confidence_{ticker}"] = (
+                        sig.confidence
+                    )
+                    continue
+
+                # Decide whether to alert
+                direction_changed = last_direction != sig.signal
+
+                if not direction_changed and not crossed_threshold:
+                    # Same direction, already alerted at this confidence
                     alerts_sent["skipped"] += 1
                     continue
 
@@ -292,10 +312,25 @@ class LivePoller:
                 )
                 if sent:
                     self.state[f"last_signal_{ticker}"] = sig.signal
+                    self.state[f"last_confidence_{ticker}"] = (
+                        sig.confidence
+                    )
                     _save_state(self.state)
                     alerts_sent["signal"] += 1
+
+                    # Build context for log message
+                    if direction_changed:
+                        reason = "direction change"
+                    elif crossed_threshold:
+                        reason = (
+                            f"crossed {self.confidence_threshold:.0%} "
+                            f"threshold"
+                        )
+                    else:
+                        reason = "alert"
+
                     log.info(
-                        f"[{ticker}] ALERT SENT — "
+                        f"[{ticker}] ALERT SENT ({reason}) — "
                         f"{sig.signal} ({sig.confidence:.1%}) "
                         f"{'[with chart]' if chart_bytes else '[text only]'}"
                     )
@@ -434,6 +469,7 @@ class LivePoller:
         for k, v in self.state.items():
             if (
                 k.startswith("last_signal_") or
+                k.startswith("last_confidence_") or
                 k == "last_newsapi_poll"
             ):
                 cleaned_state[k] = v
