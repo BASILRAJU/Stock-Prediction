@@ -4,29 +4,22 @@ venv/
 # Environment variables - NEVER commit
 .env
 
-# Data files
+# Data files - all stored on Hugging Face Hub or regenerated locally
 data/raw/
 data/cache/
 data/charts/
-
-# INCLUDE trained models AND processed features in git
-!data/models/
-!data/models/**
-!data/processed/
-!data/processed/**
+data/charts_annotated/
+data/models/
+data/processed/
 
 # Log files
 logs/
 
-# Python cache - never needed on GitHub
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Parquet files (but include processed features)
-*.parquet
-!data/processed/*.parquet
 
 # VS Code
 .vscode/
@@ -34,6 +27,6 @@ __pycache__/
 # Windows
 Thumbs.db
 desktop.ini
-# Chart caches — regenerated locally, too big for git
-data/charts/
-data/charts_annotated/
+
+# Test artifacts
+test_alert_chart.png
